@@ -1,6 +1,7 @@
 //! Keystroke — a typing tutor built with Slint.
 
 mod finger;
+mod keyboard_layout;
 mod lessons;
 mod texts;
 
@@ -11,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use slint::{ModelRc, Timer, TimerMode, VecModel};
 
-use finger::{finger_for_char, Finger};
+use finger::Finger;
+use keyboard_layout::KeyboardLayout;
 
 slint::include_modules!();
 
@@ -103,10 +105,11 @@ struct AppState {
     best_wpm: Option<f64>,
     last_lesson_index: usize,
     last_text_index: usize,
+    layout: &'static KeyboardLayout,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(layout: &'static KeyboardLayout) -> Self {
         Self {
             mode: Mode::Home,
             session: None,
@@ -114,6 +117,7 @@ impl AppState {
             best_wpm: None,
             last_lesson_index: 0,
             last_text_index: 0,
+            layout,
         }
     }
 }
@@ -137,9 +141,12 @@ fn wrap_indices(target: &[char], max_chars: usize) -> Vec<std::ops::Range<usize>
             last_space = Some(i);
         }
         if len_so_far > max_chars {
-            // Break at last space if available; otherwise hard-break.
+            // Break at the last space that lies strictly before `i` (so we
+            // include the space on the previous row and still make progress).
+            // If the overflowing character is itself a space, or no usable
+            // space exists in this row, hard-break at `i` instead.
             let break_at = match last_space {
-                Some(s) if s >= row_start => s + 1, // include the space on prev row
+                Some(s) if s >= row_start && s < i => s + 1,
                 _ => i,
             };
             rows.push(row_start..break_at);
@@ -159,7 +166,7 @@ fn wrap_indices(target: &[char], max_chars: usize) -> Vec<std::ops::Range<usize>
     rows
 }
 
-fn build_rows_model(session: &Session) -> ModelRc<CharRow> {
+fn build_rows_model(session: &Session, layout: &KeyboardLayout) -> ModelRc<CharRow> {
     let ranges = wrap_indices(&session.target, 56);
     let pos = session.position();
     let mut rows: Vec<CharRow> = Vec::with_capacity(ranges.len());
@@ -180,7 +187,7 @@ fn build_rows_model(session: &Session) -> ModelRc<CharRow> {
             } else {
                 0 // untyped
             };
-            let fg = finger_for_char(ch).as_i32();
+            let fg = layout.finger_for_char(ch).as_i32();
             cells.push(CharCell {
                 character: ch.to_string().into(),
                 state,
@@ -192,6 +199,38 @@ fn build_rows_model(session: &Session) -> ModelRc<CharRow> {
         });
     }
     ModelRc::new(VecModel::from(rows))
+}
+
+/// Build a [`KeyRow`] model from a static [`KeyboardLayout`] for the Slint UI.
+fn build_keyboard_rows(layout: &KeyboardLayout) -> ModelRc<KeyRow> {
+    let rows: Vec<KeyRow> = layout
+        .rows
+        .iter()
+        .map(|row| {
+            let keys: Vec<KeyDef> = row
+                .iter()
+                .map(|k| KeyDef {
+                    label: k.label.into(),
+                    unshifted: char_to_string(k.unshifted).into(),
+                    shifted: char_to_string(k.shifted).into(),
+                    width: k.width,
+                    finger: k.finger.as_i32(),
+                })
+                .collect();
+            KeyRow {
+                keys: ModelRc::new(VecModel::from(keys)),
+            }
+        })
+        .collect();
+    ModelRc::new(VecModel::from(rows))
+}
+
+fn char_to_string(c: char) -> String {
+    if c == '\0' {
+        String::new()
+    } else {
+        c.to_string()
+    }
 }
 
 fn finger_label(f: Finger) -> &'static str {
@@ -229,23 +268,27 @@ fn update_session_view(ui: &AppWindow, state: &AppState) {
         }
         Mode::Practice(i) => {
             let text = &texts::TEXTS[i];
-            ui.set_session_title(format!("Practice: {}", text.title).into());
+            ui.set_session_title(text.title.into());
             ui.set_session_description(
-                "Type the text below as quickly and accurately as you can. \
-                 The progress bar fills up as you advance."
-                    .into(),
+                format!(
+                    "From {} \u{2014} type the passage below as quickly and accurately as you can.",
+                    text.source
+                )
+                .into(),
             );
         }
         Mode::Home => return,
     }
 
-    ui.set_rows(build_rows_model(session));
+    ui.set_rows(build_rows_model(session, state.layout));
 
     // Highlight next key + finger
     if let Some(&c) = session.target.get(session.position()) {
-        let lower = c.to_ascii_lowercase().to_string();
-        ui.set_next_key(lower.into());
-        let f = finger_for_char(c);
+        // Send the raw character; the Slint Key element matches against
+        // either the unshifted or shifted character of each key, so this works
+        // for both lowercase and shifted/non-ASCII characters.
+        ui.set_next_key(c.to_string().into());
+        let f = state.layout.finger_for_char(c);
         ui.set_active_finger(f.as_i32());
         ui.set_finger_hint_index(f.as_i32());
         let display_char = if c == ' ' {
@@ -310,12 +353,12 @@ fn refresh_picker_lists(ui: &AppWindow, state: &AppState) {
         .collect();
     ui.set_lessons_list(ModelRc::new(VecModel::from(items)));
 
-    // Texts sidebar
+    // Texts sidebar — subtitle is the source attribution.
     let items: Vec<PickerItem> = texts::TEXTS
         .iter()
         .map(|t| PickerItem {
             title: t.title.into(),
-            subtitle: format!("{} characters", t.content.chars().count()).into(),
+            subtitle: t.source.into(),
             completed: false,
         })
         .collect();
@@ -406,6 +449,10 @@ fn handle_key_typed(ui: &AppWindow, state: &Rc<RefCell<AppState>>, text: &str) {
         return;
     }
 
+    // Capture layout up-front to avoid borrowing `s` again while a mutable
+    // borrow of `s.session` is active.
+    let layout = s.layout;
+
     let session = match s.session.as_mut() {
         Some(x) => x,
         None => return,
@@ -433,10 +480,11 @@ fn handle_key_typed(ui: &AppWindow, state: &Rc<RefCell<AppState>>, text: &str) {
     }
     session.typed.push(typed_char);
 
-    // Visual feedback: pressed key + pressed finger
-    let pressed_key = typed_char.to_ascii_lowercase().to_string();
-    ui.set_pressed_key(pressed_key.into());
-    let pf = finger_for_char(typed_char).as_i32();
+    // Visual feedback: pressed key + pressed finger.
+    // Send the actual character typed; the Slint Key element matches both
+    // unshifted and shifted forms so this works for capitals and symbols.
+    ui.set_pressed_key(typed_char.to_string().into());
+    let pf = layout.finger_for_char(typed_char).as_i32();
     ui.set_pressed_finger(pf);
     schedule_clear_pressed(ui);
 
@@ -473,8 +521,24 @@ fn handle_backspace(ui: &AppWindow, state: &Rc<RefCell<AppState>>) {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Detect the active keyboard layout reported by the OS. Falls back to
+    // US QWERTY when detection fails or the layout isn't in our table.
+    let detected = keyboard_layout::detect();
+    let layout = detected.layout;
+
     let ui = AppWindow::new()?;
-    let state = Rc::new(RefCell::new(AppState::new()));
+    let state = Rc::new(RefCell::new(AppState::new(layout)));
+
+    // Configure the virtual keyboard widget and the layout label in the top bar.
+    ui.set_keyboard_rows(build_keyboard_rows(layout));
+    let layout_label = match detected.detected_klid.as_deref() {
+        None => format!("{}  (default \u{2014} detection unavailable)", layout.name),
+        Some(klid) if !detected.is_exact_match => {
+            format!("{}  (KLID {} \u{2014} using fallback)", layout.name, klid)
+        }
+        Some(klid) => format!("{}  (KLID {})", layout.name, klid),
+    };
+    ui.set_layout_name(layout_label.into());
 
     refresh_picker_lists(&ui, &state.borrow());
     refresh_home(&ui, &state.borrow());
@@ -626,4 +690,71 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.run()?;
     drop(live_timer);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_indices;
+
+    fn chars(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn wrap_short_text_returns_single_row() {
+        let t = chars("hello world");
+        let rows = wrap_indices(&t, 56);
+        assert_eq!(rows, vec![0..11]);
+    }
+
+    #[test]
+    fn wrap_empty_text_returns_one_empty_row() {
+        let rows = wrap_indices(&[], 56);
+        assert_eq!(rows, vec![0..0]);
+    }
+
+    #[test]
+    fn wrap_breaks_at_previous_space() {
+        let t = chars("aa bb cc dd ee");
+        let rows = wrap_indices(&t, 5);
+        // First row "aa bb" fills exactly 5 chars, then the space at index 5
+        // overflows and forces a hard break (no usable earlier space is
+        // strictly before i), so the leading space appears on row 2.
+        assert_eq!(rows, vec![0..5, 5..9, 9..14]);
+    }
+
+    // Regression test: previously, when the character at position `i` was a
+    // space that itself pushed the row past `max_chars`, the algorithm broke
+    // at `i + 1` without advancing `i`, causing `i - row_start` to underflow
+    // on the next iteration. Reproduced when clicking Next from "Peer Gynt"
+    // to "Sult (åpning)" in the Norwegian sample texts.
+    #[test]
+    fn wrap_does_not_panic_when_overflowing_char_is_space() {
+        let t = chars(
+            "Det var i den tid jeg gikk omkring og sultet i Kristiania, denne \
+             forunderlige by som ingen forlater før han har fått merker av den.",
+        );
+        let rows = wrap_indices(&t, 56);
+        assert!(!rows.is_empty());
+        // Every range must be non-empty and sequential.
+        let mut last_end = 0usize;
+        for r in &rows {
+            assert!(
+                r.start == last_end,
+                "row {:?} does not start at {}",
+                r,
+                last_end
+            );
+            assert!(r.end > r.start, "row {:?} is empty", r);
+            last_end = r.end;
+        }
+        assert_eq!(last_end, t.len());
+    }
+
+    #[test]
+    fn wrap_hard_breaks_when_no_space_fits() {
+        let t = chars("abcdefghij");
+        let rows = wrap_indices(&t, 3);
+        assert_eq!(rows, vec![0..3, 3..6, 6..9, 9..10]);
+    }
 }

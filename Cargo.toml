@@ -7,5 +7,8 @@ description = "A typing tutor inspired by Typing Pal, built with Slint"
 [dependencies]
 slint = "1.8"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_UI_Input_KeyboardAndMouse"] }
+
 [build-dependencies]
 slint-build = "1.8"
