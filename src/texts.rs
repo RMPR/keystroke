@@ -106,3 +106,18 @@ pub const TEXTS: &[SampleText] = &[
         content: "Det var en gang en konge som hadde en datter, og hun var så vakker at det gikk gjetord om henne over alle land.",
     },
 ];
+
+/// Returns the content of a pseudo-randomly chosen sample text.
+///
+/// Used by the LAN multiplayer race game to pick a passage. The selection is
+/// derived from the current system time so it doesn't require a randomness
+/// dependency, and is good enough for "don't always pick the same one".
+pub fn pick_random_text() -> &'static str {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let idx = (nanos as usize) % TEXTS.len();
+    TEXTS[idx].content
+}

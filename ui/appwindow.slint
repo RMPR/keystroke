@@ -2,7 +2,7 @@
 //  Keystroke - a typing tutor inspired by Typing Pal / Ten Thumbs
 // =============================================================================
 
-import { Button, ListView, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { Button, ListView, ScrollView, VerticalBox, HorizontalBox, LineEdit } from "std-widgets.slint";
 
 // -----------------------------------------------------------------------------
 //  Theme & shared types
@@ -54,7 +54,17 @@ export global Theme {
 }
 
 // Page identifier - mirrored in Rust
-export enum AppPage { home, lessons, practice }
+export enum AppPage { home, lessons, practice, game }
+
+// Game-mode sub-state - mirrored in Rust
+export enum GameState { lobby, countdown, racing, finished }
+
+// One peer in the LAN lobby
+export struct LanPeer {
+    id: string,
+    name: string,
+    address: string,   // e.g. "192.168.1.7:54321"
+}
 
 // State of a single character cell:
 //   0 = untyped, 1 = correct, 2 = wrong, 3 = current (cursor)
@@ -510,6 +520,7 @@ component TopBar inherits Rectangle {
     callback nav-home();
     callback nav-lessons();
     callback nav-practice();
+    callback nav-game();
 
     height: 56px;
     background: Theme.panel;
@@ -625,6 +636,23 @@ component TopBar inherits Rectangle {
                 }
             }
         }
+        TouchArea {
+            width: 100px;
+            clicked => { root.nav-game(); }
+            Rectangle {
+                background: root.current-page == AppPage.game ? Theme.panel-soft : transparent;
+                border-radius: 8px;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "Games";
+                    color: root.current-page == AppPage.game ? Theme.accent : Theme.text-secondary;
+                    font-size: 14px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
     }
 }
 
@@ -636,6 +664,7 @@ component HomePage inherits Rectangle {
     in property <string> last-result-text;
     callback nav-lessons();
     callback nav-practice();
+    callback nav-game();
 
     background: Theme.bg;
 
@@ -672,6 +701,12 @@ component HomePage inherits Rectangle {
                 title: "Practice";
                 subtitle: "Pick a sample text and measure your speed and accuracy in a free typing test.";
                 clicked => { root.nav-practice(); }
+            }
+            NavCard {
+                icon: "🎮";
+                title: "Games";
+                subtitle: "Race other Keystroke users on your network in a head-to-head typing match.";
+                clicked => { root.nav-game(); }
             }
             NavCard {
                 icon: "🎯";
@@ -832,6 +867,528 @@ component SessionPanel inherits Rectangle {
     }
 }
 
+// -----------------------------------------------------------------------------
+//  Games page (LAN multiplayer typing race)
+// -----------------------------------------------------------------------------
+
+component PeerRow inherits Rectangle {
+    in property <LanPeer> peer;
+    callback race-clicked(string);
+
+    height: 70px;
+    border-radius: 10px;
+    background: touch.has-hover ? Theme.panel-soft : Theme.panel;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.divider;
+    animate background, border-color { duration: 120ms; }
+
+    touch := TouchArea {
+        clicked => { root.race-clicked(root.peer.id); }
+    }
+
+    HorizontalLayout {
+        padding: 14px;
+        spacing: 14px;
+        alignment: stretch;
+
+        // Avatar circle with the first letter of the name
+        Rectangle {
+            width: 42px;
+            height: 42px;
+            border-radius: 21px;
+            background: Theme.accent-strong;
+            y: (parent.height - 42px) / 2;
+            Text {
+                text: root.peer.name.character-count > 0 ? root.peer.name : "?";
+                color: Theme.text-primary;
+                font-size: 18px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.peer.name;
+                color: Theme.text-primary;
+                font-size: 15px;
+                font-weight: 600;
+            }
+            Text {
+                text: root.peer.address;
+                color: Theme.text-secondary;
+                font-size: 11px;
+            }
+        }
+
+        Rectangle {
+            width: 90px;
+            y: (parent.height - 34px) / 2;
+            height: 34px;
+            border-radius: 8px;
+            background: race-touch.has-hover ? Theme.accent : Theme.accent-strong;
+            animate background { duration: 120ms; }
+            race-touch := TouchArea {
+                clicked => { root.race-clicked(root.peer.id); }
+            }
+            Text {
+                text: "Race ▶";
+                color: Theme.text-primary;
+                font-size: 13px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+component GameLobby inherits Rectangle {
+    in property <string>     my-name;
+    in-out property <string> name-draft;
+    in property <string>     network-status;
+    in property <[LanPeer]>  peers;
+    in property <string>     game-message;
+    in property <string>     incoming-request-name;
+    callback peer-clicked(string);
+    callback rename-player(string);
+    callback accept-incoming();
+    callback reject-incoming();
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        padding: 28px;
+        spacing: 18px;
+
+        // Header
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: "LAN Race Lobby";
+                color: Theme.text-primary;
+                font-size: 24px;
+                font-weight: 800;
+            }
+            Text {
+                text: "Other Keystroke users on your network appear here automatically. Click one to start a race.";
+                color: Theme.text-secondary;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        // Incoming-race-request banner (only shown when someone is asking us)
+        if root.incoming-request-name != "" : Rectangle {
+            height: 72px;
+            border-radius: 10px;
+            background: Theme.accent-strong;
+            border-width: 2px;
+            border-color: Theme.accent;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 14px;
+                alignment: stretch;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: "🎯  " + root.incoming-request-name + " wants to race you!";
+                        color: Theme.text-primary;
+                        font-size: 15px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: "Click Accept to start the countdown, or Decline to keep them in the lobby.";
+                        color: Theme.text-primary;
+                        font-size: 11px;
+                    }
+                }
+                Button {
+                    text: "Decline";
+                    clicked => { root.reject-incoming(); }
+                }
+                Button {
+                    text: "Accept ▶";
+                    primary: true;
+                    clicked => { root.accept-incoming(); }
+                }
+            }
+        }
+
+        // "Me" card with inline rename
+        Rectangle {
+            height: 88px;
+            border-radius: 10px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.divider;
+            HorizontalLayout {
+                padding: 14px;
+                spacing: 14px;
+                Rectangle {
+                    width: 46px; height: 46px;
+                    border-radius: 23px;
+                    background: Theme.correct;
+                    y: (parent.height - 46px) / 2;
+                    Text {
+                        text: "👤";
+                        color: Theme.bg;
+                        font-size: 22px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "You: " + root.my-name;
+                        color: Theme.text-primary;
+                        font-size: 14px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.network-status;
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 4px;
+                    Text {
+                        text: "Display name";
+                        color: Theme.text-muted;
+                        font-size: 10px;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        LineEdit {
+                            text <=> root.name-draft;
+                            placeholder-text: "Your name";
+                            width: 180px;
+                            accepted(t) => { root.rename-player(t); }
+                        }
+                        Button {
+                            text: "Save";
+                            clicked => { root.rename-player(root.name-draft); }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "Players on your network";
+            color: Theme.text-primary;
+            font-size: 15px;
+            font-weight: 700;
+        }
+
+        if root.peers.length == 0 : Rectangle {
+            min-height: 160px;
+            border-radius: 12px;
+            background: Theme.panel;
+            border-width: 1px;
+            border-color: Theme.divider;
+            VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                Text {
+                    text: "📡";
+                    font-size: 40px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Searching for other players…";
+                    color: Theme.text-secondary;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    text: "Open Keystroke on another device (or another instance on this PC) and switch to the Games tab.";
+                    color: Theme.text-muted;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if root.peers.length > 0 : ScrollView {
+            VerticalLayout {
+                spacing: 8px;
+                for p in root.peers : PeerRow {
+                    peer: p;
+                    race-clicked(id) => { root.peer-clicked(id); }
+                }
+            }
+        }
+
+        // Status / error line
+        if root.game-message != "" : Text {
+            text: root.game-message;
+            color: Theme.text-secondary;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component CountdownOverlay inherits Rectangle {
+    in property <int>    seconds-left;
+    in property <string> opponent-name;
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+        Text {
+            text: "Racing " + root.opponent-name;
+            color: Theme.text-secondary;
+            font-size: 18px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.seconds-left > 0 ? root.seconds-left : "GO!";
+            color: Theme.accent;
+            font-size: 140px;
+            font-weight: 900;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Get your fingers on the home row…";
+            color: Theme.text-muted;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component OpponentBar inherits Rectangle {
+    in property <string> name;
+    in property <float>  progress;       // 0..1
+    in property <bool>   finished;
+    in property <string> stats-text;     // e.g. "42 WPM / 96%"
+
+    height: 56px;
+    border-radius: 10px;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.divider;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.finished ? ("🏁  " + root.name) : root.name;
+                color: Theme.text-primary;
+                font-size: 13px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.stats-text;
+                color: Theme.text-secondary;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle {
+            height: 8px;
+            border-radius: 4px;
+            background: Theme.panel-soft;
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width * root.progress;
+                height: parent.height;
+                border-radius: 4px;
+                background: root.finished ? Theme.correct : Theme.accent;
+                animate width { duration: 120ms; easing: ease-out; }
+            }
+        }
+    }
+}
+
+component GameRace inherits Rectangle {
+    in property <string>      opponent-name;
+    in property <float>       my-progress;
+    in property <float>       opponent-progress;
+    in property <bool>        opponent-finished;
+    in property <string>      my-stats-text;
+    in property <string>      opponent-stats-text;
+    in property <[CharRow]>   rows;
+    in property <string>      next-key;
+    in property <string>      pressed-key;
+    in property <int>         active-finger;
+    in property <int>         pressed-finger;
+    in property <[KeyRow]>    keyboard-rows;
+    in property <string>      wpm-text;
+    in property <string>      accuracy-text;
+    in property <string>      time-text;
+    in property <string>      errors-text;
+    in property <bool>        finished;
+    in property <string>      result-summary;
+    in property <string>      finger-hint;
+    in property <int>         finger-hint-index;
+    in property <bool>        has-last-opponent;
+    callback quit-race();
+    callback rematch();
+    callback request-focus();
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        // Header with opponent + quit
+        HorizontalLayout {
+            spacing: 12px;
+            alignment: stretch;
+            VerticalLayout {
+                spacing: 2px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Racing " + root.opponent-name;
+                    color: Theme.text-primary;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "First to finish wins. Type the passage as fast and accurately as you can.";
+                    color: Theme.text-secondary;
+                    font-size: 12px;
+                }
+            }
+            Button {
+                text: "Quit race";
+                clicked => { root.quit-race(); }
+            }
+        }
+
+        // Dual progress bars
+        OpponentBar {
+            name: "You";
+            progress: root.my-progress;
+            finished: root.finished;
+            stats-text: root.my-stats-text;
+        }
+        OpponentBar {
+            name: root.opponent-name;
+            progress: root.opponent-progress;
+            finished: root.opponent-finished;
+            stats-text: root.opponent-stats-text;
+        }
+
+        // Live personal stats
+        StatsBar {
+            wpm-text:      root.wpm-text;
+            accuracy-text: root.accuracy-text;
+            time-text:     root.time-text;
+            errors-text:   root.errors-text;
+            progress:      root.my-progress;
+        }
+
+        // Typing area
+        TypingArea {
+            rows: root.rows;
+            min-height: 110px;
+            preferred-height: 130px;
+            TouchArea { clicked => { root.request-focus(); } }
+        }
+
+        // Finger hint
+        Rectangle {
+            height: 24px;
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: center;
+                Rectangle {
+                    width: 14px; height: 14px;
+                    border-radius: 7px;
+                    background: Theme.finger-color(root.finger-hint-index);
+                    y: (parent.height - 14px) / 2;
+                }
+                Text {
+                    text: root.finger-hint;
+                    color: Theme.text-secondary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Keyboard + hands
+        VirtualKeyboard {
+            next-key: root.next-key;
+            pressed-key: root.pressed-key;
+            rows: root.keyboard-rows;
+            min-height: 250px;
+            preferred-height: 250px;
+        }
+        HandsDisplay {
+            active-finger: root.active-finger;
+            pressed-finger: root.pressed-finger;
+            min-height: 150px;
+        }
+
+        // Finished overlay
+        if root.finished : Rectangle {
+            height: 84px;
+            border-radius: 12px;
+            background: Theme.panel;
+            border-width: 2px;
+            border-color: Theme.correct;
+            HorizontalLayout {
+                padding: 16px;
+                spacing: 16px;
+                alignment: center;
+                Text {
+                    text: "🏁";
+                    font-size: 36px;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Race finished!";
+                        color: Theme.correct;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.result-summary;
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                if root.has-last-opponent : Button {
+                    text: "Rematch 🔁";
+                    primary: true;
+                    clicked => { root.rematch(); }
+                }
+                Button {
+                    text: "Back to lobby";
+                    clicked => { root.quit-race(); }
+                }
+            }
+        }
+    }
+}
+
 component PickerSidebar inherits Rectangle {
     in property <string>        header-text;
     in property <[PickerItem]>  items;
@@ -884,6 +1441,7 @@ export component AppWindow inherits Window {
     callback nav-home();
     callback nav-lessons();
     callback nav-practice();
+    callback nav-game();
 
     // ----- Home --------------------------------------------------------
     in property <string> last-result-text: "Complete a typing test to see your best result here.";
@@ -915,6 +1473,30 @@ export component AppWindow inherits Window {
     callback lesson-clicked(int);
     callback text-clicked(int);
 
+    // ----- Games -------------------------------------------------------
+    in property <GameState>    game-state:        GameState.lobby;
+    in property <string>       my-player-name:    "Player";
+    in-out property <string>   player-name-draft;
+    in property <string>       network-status:    "";
+    in property <[LanPeer]>    peers:             [];
+    in property <string>       game-message:      "";
+    in property <string>       incoming-request-name: "";
+    in property <bool>         has-last-opponent: false;
+    in property <int>          countdown-secs:    3;
+    in property <string>       opponent-name:     "";
+    in property <float>        my-progress:       0;
+    in property <float>        opponent-progress: 0;
+    in property <bool>         opponent-finished: false;
+    in property <string>       my-stats-text:     "";
+    in property <string>       opponent-stats-text: "";
+    in property <string>       race-result-summary: "";
+    callback peer-clicked(string);
+    callback quit-race();
+    callback rematch();
+    callback rename-player(string);
+    callback accept-incoming();
+    callback reject-incoming();
+
     // ----- Typing controls --------------------------------------------
     callback key-typed(string);
     callback backspace();
@@ -934,6 +1516,7 @@ export component AppWindow inherits Window {
             nav-home    => { root.nav-home(); }
             nav-lessons => { root.nav-lessons(); }
             nav-practice=> { root.nav-practice(); }
+            nav-game    => { root.nav-game(); }
         }
 
         // Divider
@@ -961,6 +1544,7 @@ export component AppWindow inherits Window {
                 last-result-text: root.last-result-text;
                 nav-lessons => { root.nav-lessons(); }
                 nav-practice => { root.nav-practice(); }
+                nav-game => { root.nav-game(); }
             }
 
             if root.page == AppPage.lessons : HorizontalLayout {
@@ -1025,6 +1609,51 @@ export component AppWindow inherits Window {
                     next-item => { root.next-item(); }
                     request-focus => { root.focus-typing(); }
                 }
+            }
+
+            if root.page == AppPage.game && root.game-state == GameState.lobby : GameLobby {
+                my-name: root.my-player-name;
+                name-draft <=> root.player-name-draft;
+                network-status: root.network-status;
+                peers: root.peers;
+                game-message: root.game-message;
+                incoming-request-name: root.incoming-request-name;
+                peer-clicked(id) => { root.peer-clicked(id); }
+                rename-player(n) => { root.rename-player(n); }
+                accept-incoming => { root.accept-incoming(); }
+                reject-incoming => { root.reject-incoming(); }
+            }
+
+            if root.page == AppPage.game && root.game-state == GameState.countdown : CountdownOverlay {
+                seconds-left: root.countdown-secs;
+                opponent-name: root.opponent-name;
+            }
+
+            if root.page == AppPage.game && (root.game-state == GameState.racing || root.game-state == GameState.finished) : GameRace {
+                opponent-name:       root.opponent-name;
+                my-progress:         root.my-progress;
+                opponent-progress:   root.opponent-progress;
+                opponent-finished:   root.opponent-finished;
+                my-stats-text:       root.my-stats-text;
+                opponent-stats-text: root.opponent-stats-text;
+                rows:                root.rows;
+                next-key:            root.next-key;
+                pressed-key:         root.pressed-key;
+                active-finger:       root.active-finger;
+                pressed-finger:      root.pressed-finger;
+                keyboard-rows:       root.keyboard-rows;
+                wpm-text:            root.wpm-text;
+                accuracy-text:       root.accuracy-text;
+                time-text:           root.time-text;
+                errors-text:         root.errors-text;
+                finished:            root.finished;
+                result-summary:      root.race-result-summary;
+                finger-hint:         root.finger-hint;
+                finger-hint-index:   root.finger-hint-index;
+                has-last-opponent:   root.has-last-opponent;
+                quit-race    => { root.quit-race(); }
+                rematch      => { root.rematch(); }
+                request-focus => { root.focus-typing(); }
             }
         }
     }

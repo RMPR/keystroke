@@ -3,6 +3,7 @@
 mod finger;
 mod keyboard_layout;
 mod lessons;
+mod net;
 mod texts;
 
 use std::cell::RefCell;
@@ -14,6 +15,7 @@ use slint::{ModelRc, Timer, TimerMode, VecModel};
 
 use finger::Finger;
 use keyboard_layout::KeyboardLayout;
+use net::{NetEvent, NetService, Peer};
 
 slint::include_modules!();
 
@@ -27,6 +29,8 @@ enum Mode {
     Home,
     Lesson(usize),
     Practice(usize),
+    /// LAN multiplayer race. The detailed sub-state is in `AppState::game`.
+    Game,
 }
 
 /// An active typing session.
@@ -106,6 +110,12 @@ struct AppState {
     last_lesson_index: usize,
     last_text_index: usize,
     layout: &'static KeyboardLayout,
+    /// Display name used in the LAN lobby. Survives navigating away from the
+    /// Games tab so the user doesn't have to re-enter it.
+    player_name: String,
+    /// Networking and race state. Only `Some` while the Games tab is active.
+    net: Option<NetService>,
+    game: GameSession,
 }
 
 impl AppState {
@@ -118,9 +128,58 @@ impl AppState {
             last_lesson_index: 0,
             last_text_index: 0,
             layout,
+            player_name: default_player_name(),
+            net: None,
+            game: GameSession::default(),
         }
     }
 }
+
+/// Multiplayer game state, valid whenever `mode == Mode::Game`.
+#[derive(Default)]
+struct GameSession {
+    sub: GameSubState,
+    peers: Vec<Peer>,
+    network_status: String,
+    message: String,
+    opponent: Option<Peer>,
+    /// Last opponent we raced — retained after the race ends so the
+    /// "Rematch" button knows who to re-invite.
+    last_opponent_id: Option<String>,
+    /// Set when another peer is asking us to race. Cleared on accept/decline
+    /// or when the request times out.
+    incoming_request: Option<Peer>,
+    text_len: usize,
+    countdown_started_at: Option<Instant>,
+    countdown_secs: i32,
+    opponent_pos: usize,
+    opponent_errors: usize,
+    opponent_finished: bool,
+    opponent_wpm: f64,
+    opponent_accuracy: f64,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum GameSubState {
+    #[default]
+    Lobby,
+    Countdown,
+    Racing,
+    Finished,
+}
+
+impl From<GameSubState> for GameState {
+    fn from(s: GameSubState) -> Self {
+        match s {
+            GameSubState::Lobby => GameState::Lobby,
+            GameSubState::Countdown => GameState::Countdown,
+            GameSubState::Racing => GameState::Racing,
+            GameSubState::Finished => GameState::Finished,
+        }
+    }
+}
+
+const COUNTDOWN_SECS: i32 = 3;
 
 // ---------------------------------------------------------------------------
 //  Helpers — text wrapping & UI building
@@ -278,6 +337,8 @@ fn update_session_view(ui: &AppWindow, state: &AppState) {
             );
         }
         Mode::Home => return,
+        // The race view has its own header; nothing to set here.
+        Mode::Game => {}
     }
 
     ui.set_rows(build_rows_model(session, state.layout));
@@ -387,6 +448,325 @@ fn refresh_home(ui: &AppWindow, state: &AppState) {
 }
 
 // ---------------------------------------------------------------------------
+//  Games — UI mirroring
+// ---------------------------------------------------------------------------
+
+fn refresh_game_view(ui: &AppWindow, state: &AppState) {
+    ui.set_game_state(state.game.sub.into());
+    ui.set_my_player_name(state.player_name.as_str().into());
+    ui.set_network_status(state.game.network_status.as_str().into());
+    ui.set_game_message(state.game.message.as_str().into());
+    ui.set_peers(build_peers_model(&state.game.peers));
+    ui.set_opponent_name(
+        state
+            .game
+            .opponent
+            .as_ref()
+            .map(|p| p.name.as_str())
+            .unwrap_or("Opponent")
+            .into(),
+    );
+    ui.set_countdown_secs(state.game.countdown_secs);
+    ui.set_incoming_request_name(
+        state
+            .game
+            .incoming_request
+            .as_ref()
+            .map(|p| p.name.as_str())
+            .unwrap_or("")
+            .into(),
+    );
+    ui.set_has_last_opponent(state.game.last_opponent_id.is_some());
+
+    // Progress bars + per-side stats
+    let (my_progress, my_stats) = if let Some(session) = &state.session {
+        let p = if session.target.is_empty() {
+            0.0
+        } else {
+            session.position() as f32 / session.target.len() as f32
+        };
+        let now = session.finished_at.unwrap_or_else(Instant::now);
+        let stats = if session.start_time.is_some() {
+            format!(
+                "{:.0} WPM / {:.0}%",
+                session.wpm(now),
+                session.accuracy()
+            )
+        } else {
+            String::new()
+        };
+        (p, stats)
+    } else {
+        (0.0, String::new())
+    };
+    ui.set_my_progress(my_progress);
+    ui.set_my_stats_text(my_stats.into());
+
+    let opp_progress = if state.game.text_len == 0 {
+        0.0
+    } else {
+        (state.game.opponent_pos as f32 / state.game.text_len as f32).min(1.0)
+    };
+    ui.set_opponent_progress(opp_progress);
+    ui.set_opponent_finished(state.game.opponent_finished);
+    let opp_stats = if state.game.opponent_finished {
+        format!(
+            "{:.0} WPM / {:.0}%",
+            state.game.opponent_wpm, state.game.opponent_accuracy
+        )
+    } else if state.game.text_len > 0 {
+        format!(
+            "{} / {} chars",
+            state.game.opponent_pos.min(state.game.text_len),
+            state.game.text_len
+        )
+    } else {
+        String::new()
+    };
+    ui.set_opponent_stats_text(opp_stats.into());
+
+    ui.set_race_result_summary(race_result_summary(state).into());
+}
+
+fn build_peers_model(peers: &[Peer]) -> ModelRc<LanPeer> {
+    let mut items: Vec<LanPeer> = peers
+        .iter()
+        .map(|p| LanPeer {
+            id: p.id.as_str().into(),
+            name: p.name.as_str().into(),
+            address: p.tcp_addr.to_string().into(),
+        })
+        .collect();
+    // Stable display order: by name, then address.
+    items.sort_by(|a, b| {
+        let an: &str = a.name.as_str();
+        let bn: &str = b.name.as_str();
+        let aa: &str = a.address.as_str();
+        let ba: &str = b.address.as_str();
+        an.cmp(bn).then(aa.cmp(ba))
+    });
+    ModelRc::new(VecModel::from(items))
+}
+
+/// Human-readable result string shown in the race "finished" panel.
+///
+/// It updates progressively: "You finished first", then "... and you won!" or
+/// "...but {opponent} caught up" once they also finish.
+fn race_result_summary(state: &AppState) -> String {
+    let opp_name = state
+        .game
+        .opponent
+        .as_ref()
+        .map(|p| p.name.as_str())
+        .unwrap_or("Opponent");
+    let me_done = state
+        .session
+        .as_ref()
+        .map(|s| s.is_finished())
+        .unwrap_or(false);
+    let opp_done = state.game.opponent_finished;
+
+    if !me_done && !opp_done {
+        return String::new();
+    }
+
+    let (my_wpm, my_acc) = match state.session.as_ref() {
+        Some(s) if s.is_finished() => {
+            let now = s.finished_at.unwrap_or_else(Instant::now);
+            (s.wpm(now), s.accuracy())
+        }
+        _ => (0.0, 0.0),
+    };
+
+    match (me_done, opp_done) {
+        (true, true) => {
+            let winner = if my_wpm > state.game.opponent_wpm + 0.5 {
+                "\u{1F3C6} You won!".to_string()
+            } else if state.game.opponent_wpm > my_wpm + 0.5 {
+                format!("\u{1F948} {} won.", opp_name)
+            } else {
+                "\u{1F91D} It's a tie!".to_string()
+            };
+            format!(
+                "{}  \u{2014}  You: {:.0} WPM / {:.0}%   |   {}: {:.0} WPM / {:.0}%",
+                winner,
+                my_wpm,
+                my_acc,
+                opp_name,
+                state.game.opponent_wpm,
+                state.game.opponent_accuracy,
+            )
+        }
+        (true, false) => format!(
+            "\u{1F3C1} You finished first \u{2014} {:.0} WPM / {:.0}%. Waiting for {}\u{2026}",
+            my_wpm, my_acc, opp_name
+        ),
+        (false, true) => format!(
+            "{} finished at {:.0} WPM / {:.0}% \u{2014} keep going!",
+            opp_name, state.game.opponent_wpm, state.game.opponent_accuracy
+        ),
+        (false, false) => String::new(),
+    }
+}
+
+fn default_player_name() -> String {
+    std::env::var("USERNAME")
+        .ok()
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Player".to_string())
+}
+
+fn start_game(state: &mut AppState) -> Result<(), String> {
+    if state.net.is_none() {
+        match NetService::start(state.player_name.clone()) {
+            Ok(net) => {
+                state.net = Some(net);
+            }
+            Err(e) => {
+                state.game.message = format!("Failed to start LAN networking: {}", e);
+                return Err(state.game.message.clone());
+            }
+        }
+    }
+    state.mode = Mode::Game;
+    state.session = None;
+    let net_ref = state.net.as_ref();
+    state.game = GameSession {
+        sub: GameSubState::Lobby,
+        peers: net_ref.map(|n| n.current_peers()).unwrap_or_default(),
+        network_status: net_ref
+            .map(|n| format!("Listening on TCP port {} as \"{}\"", n.tcp_port, state.player_name))
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    Ok(())
+}
+
+fn stop_game(state: &mut AppState) {
+    if let Some(net) = state.net.take() {
+        net.quit_race();
+        // `net` dropped here — worker threads see `running = false` and exit.
+        drop(net);
+    }
+    state.game = GameSession::default();
+    state.session = None;
+}
+
+/// Called when either `RaceStartedAsServer` or `RaceStartedAsClient` arrives.
+/// Sets up the local Session and starts the countdown.
+fn enter_race(state: &mut AppState, text: String, opponent: Peer) {
+    state.session = Some(Session::new(&text));
+    state.game.last_opponent_id = Some(opponent.id.clone());
+    state.game.opponent = Some(opponent);
+    state.game.text_len = text.chars().count();
+    state.game.opponent_pos = 0;
+    state.game.opponent_errors = 0;
+    state.game.opponent_finished = false;
+    state.game.opponent_wpm = 0.0;
+    state.game.opponent_accuracy = 0.0;
+    state.game.sub = GameSubState::Countdown;
+    state.game.countdown_started_at = Some(Instant::now());
+    state.game.countdown_secs = COUNTDOWN_SECS;
+    state.game.message.clear();
+    state.game.incoming_request = None;
+}
+
+fn quit_race_locally(state: &mut AppState) {
+    if let Some(net) = state.net.as_ref() {
+        net.quit_race();
+    }
+    state.session = None;
+    state.game.sub = GameSubState::Lobby;
+    state.game.opponent = None;
+    state.game.text_len = 0;
+    state.game.opponent_pos = 0;
+    state.game.opponent_errors = 0;
+    state.game.opponent_finished = false;
+    state.game.countdown_started_at = None;
+    state.game.incoming_request = None;
+}
+
+/// Apply a single `NetEvent` to the application state. The caller is
+/// responsible for refreshing UI views afterwards (the live timer does this
+/// on every tick).
+fn apply_net_event(_ui: &AppWindow, state: &mut AppState, event: NetEvent) {
+    match event {
+        NetEvent::PeersUpdated(peers) => {
+            state.game.peers = peers;
+        }
+        NetEvent::Status(msg) => {
+            state.game.network_status = msg;
+        }
+        NetEvent::IncomingRaceRequest { opponent } => {
+            // If we're not on the lobby screen, auto-decline so we don't
+            // hijack a race that's already in progress.
+            let can_show =
+                matches!(state.mode, Mode::Game) && state.game.sub == GameSubState::Lobby;
+            if can_show {
+                state.game.incoming_request = Some(opponent);
+            } else if let Some(net) = state.net.as_ref() {
+                net.reject_incoming_race();
+            }
+        }
+        NetEvent::RaceStartedAsServer { text, opponent }
+        | NetEvent::RaceStartedAsClient { text, opponent } => {
+            // Only honour race-start events while the user is on the Games tab.
+            if matches!(state.mode, Mode::Game) {
+                enter_race(state, text, opponent);
+            }
+        }
+        NetEvent::OpponentProgress { position, errors } => {
+            state.game.opponent_pos = position;
+            state.game.opponent_errors = errors;
+        }
+        NetEvent::OpponentFinished { wpm, accuracy } => {
+            state.game.opponent_finished = true;
+            state.game.opponent_wpm = wpm;
+            state.game.opponent_accuracy = accuracy;
+            state.game.opponent_pos = state.game.text_len;
+            // Once opponent is done, if we're also done, promote sub-state.
+            if let Some(s) = state.session.as_ref() {
+                if s.is_finished() {
+                    state.game.sub = GameSubState::Finished;
+                }
+            }
+        }
+        NetEvent::OpponentDisconnected => {
+            // If we were mid-race, treat as the opponent giving up.
+            if matches!(state.mode, Mode::Game)
+                && (state.game.sub == GameSubState::Countdown
+                    || state.game.sub == GameSubState::Racing)
+            {
+                state.game.message = format!(
+                    "{} left the race.",
+                    state
+                        .game
+                        .opponent
+                        .as_ref()
+                        .map(|p| p.name.as_str())
+                        .unwrap_or("Opponent")
+                );
+                state.session = None;
+                state.game.sub = GameSubState::Lobby;
+                state.game.opponent = None;
+                state.game.text_len = 0;
+                state.game.countdown_started_at = None;
+            }
+        }
+        NetEvent::InviteRejected { opponent_id: _ } => {
+            // The remote peer was busy or declined our invitation.
+            state.game.message =
+                "They're busy or declined the race. Try again in a moment.".to_string();
+            // Make sure we're not waiting in any half-armed state.
+            state.game.sub = GameSubState::Lobby;
+            state.game.opponent = None;
+            state.session = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  Session helpers
 // ---------------------------------------------------------------------------
 
@@ -408,7 +788,7 @@ fn restart_current(state: &mut AppState) {
     match state.mode {
         Mode::Lesson(i) => state.session = Some(Session::new(lessons::LESSONS[i].text)),
         Mode::Practice(i) => state.session = Some(Session::new(texts::TEXTS[i].content)),
-        Mode::Home => {}
+        Mode::Home | Mode::Game => {}
     }
 }
 
@@ -422,7 +802,7 @@ fn advance_to_next(state: &mut AppState) {
             let next = (i + 1) % texts::TEXTS.len();
             start_practice(state, next);
         }
-        Mode::Home => {}
+        Mode::Home | Mode::Game => {}
     }
 }
 
@@ -449,9 +829,15 @@ fn handle_key_typed(ui: &AppWindow, state: &Rc<RefCell<AppState>>, text: &str) {
         return;
     }
 
+    // In game mode, ignore keystrokes unless we're actually racing.
+    if matches!(s.mode, Mode::Game) && s.game.sub != GameSubState::Racing {
+        return;
+    }
+
     // Capture layout up-front to avoid borrowing `s` again while a mutable
     // borrow of `s.session` is active.
     let layout = s.layout;
+    let mode = s.mode;
 
     let session = match s.session.as_mut() {
         Some(x) => x,
@@ -488,36 +874,89 @@ fn handle_key_typed(ui: &AppWindow, state: &Rc<RefCell<AppState>>, text: &str) {
     ui.set_pressed_finger(pf);
     schedule_clear_pressed(ui);
 
+    // Snapshot the values we may need to forward to the net layer below; we
+    // do this before any potential `s.session` mutation that would invalidate
+    // the borrow.
+    let session_pos = session.position();
+    let session_errors = session.errors;
+    let target_len = session.target.len();
+
     // Did we just finish?
-    if session.position() >= session.target.len() {
+    let mut just_finished = false;
+    if session_pos >= target_len {
         session.finished_at = Some(Instant::now());
         let final_wpm = session.wpm(session.finished_at.unwrap());
-        if let Mode::Lesson(i) = s.mode {
-            s.lessons_completed.insert(i);
+        just_finished = true;
+        match mode {
+            Mode::Lesson(i) => {
+                s.lessons_completed.insert(i);
+                if s.best_wpm.map_or(true, |b| final_wpm > b) {
+                    s.best_wpm = Some(final_wpm);
+                }
+                refresh_home(ui, &s);
+                refresh_picker_lists(ui, &s);
+            }
+            Mode::Practice(_) => {
+                if s.best_wpm.map_or(true, |b| final_wpm > b) {
+                    s.best_wpm = Some(final_wpm);
+                }
+                refresh_home(ui, &s);
+                refresh_picker_lists(ui, &s);
+            }
+            Mode::Game => {
+                s.game.sub = GameSubState::Finished;
+            }
+            Mode::Home => {}
         }
-        if s.best_wpm.map_or(true, |b| final_wpm > b) {
-            s.best_wpm = Some(final_wpm);
-        }
-        refresh_home(ui, &s);
-        refresh_picker_lists(ui, &s);
     }
 
-    update_session_view(ui, &s);
+    // For race mode, forward our progress to the opponent (after dropping
+    // any borrows above).
+    if matches!(mode, Mode::Game) {
+        if let Some(net) = s.net.as_ref() {
+            net.send_progress(session_pos, session_errors);
+            if just_finished {
+                let sess = s.session.as_ref().unwrap();
+                let now = sess.finished_at.unwrap_or_else(Instant::now);
+                net.send_done(sess.wpm(now), sess.accuracy());
+            }
+        }
+    }
+
+    if matches!(mode, Mode::Game) {
+        refresh_game_view(ui, &s);
+    } else {
+        update_session_view(ui, &s);
+    }
 }
 
 fn handle_backspace(ui: &AppWindow, state: &Rc<RefCell<AppState>>) {
     let mut s = state.borrow_mut();
-    let session = match s.session.as_mut() {
-        Some(x) => x,
-        None => return,
-    };
-    if session.is_finished() {
+    if matches!(s.mode, Mode::Game) && s.game.sub != GameSubState::Racing {
         return;
     }
-    if session.position() > 0 {
-        session.typed.pop();
+    let mode = s.mode;
+    let (pos, errors) = {
+        let session = match s.session.as_mut() {
+            Some(x) => x,
+            None => return,
+        };
+        if session.is_finished() {
+            return;
+        }
+        if session.position() > 0 {
+            session.typed.pop();
+        }
+        (session.position(), session.errors)
+    };
+    if matches!(mode, Mode::Game) {
+        if let Some(net) = s.net.as_ref() {
+            net.send_progress(pos, errors);
+        }
+        refresh_game_view(ui, &s);
+    } else {
+        update_session_view(ui, &s);
     }
-    update_session_view(ui, &s);
 }
 
 fn main() -> Result<(), slint::PlatformError> {
@@ -550,6 +989,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_nav_home(move || {
             if let Some(ui) = ui_handle.upgrade() {
                 let mut s = state.borrow_mut();
+                if matches!(s.mode, Mode::Game) {
+                    stop_game(&mut s);
+                }
                 s.mode = Mode::Home;
                 s.session = None;
                 ui.set_page(AppPage::Home);
@@ -563,6 +1005,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_nav_lessons(move || {
             if let Some(ui) = ui_handle.upgrade() {
                 let mut s = state.borrow_mut();
+                if matches!(s.mode, Mode::Game) {
+                    stop_game(&mut s);
+                }
                 let idx = match s.mode {
                     Mode::Lesson(i) => i,
                     _ => s.last_lesson_index,
@@ -581,6 +1026,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_nav_practice(move || {
             if let Some(ui) = ui_handle.upgrade() {
                 let mut s = state.borrow_mut();
+                if matches!(s.mode, Mode::Game) {
+                    stop_game(&mut s);
+                }
                 let idx = match s.mode {
                     Mode::Practice(i) => i,
                     _ => s.last_text_index,
@@ -590,6 +1038,23 @@ fn main() -> Result<(), slint::PlatformError> {
                 refresh_picker_lists(&ui, &s);
                 update_session_view(&ui, &s);
                 ui.invoke_focus_typing();
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_nav_game(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                // Re-clicking the Games tab while already there must not
+                // tear down an in-progress race — just refresh the view.
+                if !matches!(s.mode, Mode::Game) {
+                    let _ = start_game(&mut s);
+                }
+                ui.set_page(AppPage::Game);
+                ui.set_player_name_draft(s.player_name.as_str().into());
+                refresh_game_view(&ui, &s);
             }
         });
     }
@@ -618,6 +1083,157 @@ fn main() -> Result<(), slint::PlatformError> {
                 refresh_picker_lists(&ui, &s);
                 update_session_view(&ui, &s);
                 ui.invoke_focus_typing();
+            }
+        });
+    }
+
+    // ----- Game callbacks --------------------------------------------------
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_peer_clicked(move |peer_id| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                if !matches!(s.mode, Mode::Game) {
+                    return;
+                }
+                // Don't allow re-inviting while we're already racing.
+                if s.game.sub != GameSubState::Lobby {
+                    return;
+                }
+                let id: String = peer_id.into();
+                if let Some(net) = s.net.as_ref() {
+                    match net.invite(&id) {
+                        Ok(()) => {
+                            s.game.message = "Connecting\u{2026}".into();
+                        }
+                        Err(e) => {
+                            s.game.message = format!("Could not start race: {}", e);
+                        }
+                    }
+                    refresh_game_view(&ui, &s);
+                }
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_quit_race(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                if !matches!(s.mode, Mode::Game) {
+                    return;
+                }
+                quit_race_locally(&mut s);
+                refresh_game_view(&ui, &s);
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_accept_incoming(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                if !matches!(s.mode, Mode::Game) {
+                    return;
+                }
+                if let Some(net) = s.net.as_ref() {
+                    net.accept_incoming_race();
+                }
+                s.game.incoming_request = None;
+                s.game.message = "Starting race\u{2026}".into();
+                refresh_game_view(&ui, &s);
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_reject_incoming(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                if !matches!(s.mode, Mode::Game) {
+                    return;
+                }
+                if let Some(net) = s.net.as_ref() {
+                    net.reject_incoming_race();
+                }
+                s.game.incoming_request = None;
+                refresh_game_view(&ui, &s);
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_rematch(move || {
+            if let Some(ui_now) = ui_handle.upgrade() {
+                let opp_id = {
+                    let mut s = state.borrow_mut();
+                    if !matches!(s.mode, Mode::Game) {
+                        return;
+                    }
+                    let id = s.game.last_opponent_id.clone();
+                    quit_race_locally(&mut s);
+                    s.game.message = "Requesting rematch\u{2026}".into();
+                    refresh_game_view(&ui_now, &s);
+                    id
+                };
+                // Wait a beat so the opponent's relay thread sees our QUIT
+                // and clears its race slot before we send the new invite.
+                if let Some(id) = opp_id {
+                    let ui_handle = ui_handle.clone();
+                    let state = state.clone();
+                    Timer::single_shot(Duration::from_millis(300), move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            let mut s = state.borrow_mut();
+                            if !matches!(s.mode, Mode::Game) {
+                                return;
+                            }
+                            if let Some(net) = s.net.as_ref() {
+                                match net.invite(&id) {
+                                    Ok(()) => {
+                                        s.game.message = "Rematch invite sent\u{2026}".into();
+                                    }
+                                    Err(e) => {
+                                        s.game.message = format!("Rematch failed: {}", e);
+                                    }
+                                }
+                            }
+                            refresh_game_view(&ui, &s);
+                        }
+                    });
+                }
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_rename_player(move |new_name| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                let raw: String = new_name.into();
+                let trimmed = raw.trim();
+                let name = if trimmed.is_empty() {
+                    "Player".to_string()
+                } else {
+                    trimmed.to_string()
+                };
+                s.player_name = name.clone();
+                if let Some(net) = s.net.as_ref() {
+                    net.set_name(name.clone());
+                }
+                s.game.network_status = match s.net.as_ref() {
+                    Some(net) => format!("Listening on TCP port {} as \"{}\"", net.tcp_port, name),
+                    None => String::new(),
+                };
+                // Mirror the canonical (trimmed / non-empty) name back into
+                // the LineEdit so the user sees the normalised value.
+                ui.set_player_name_draft(name.as_str().into());
+                refresh_game_view(&ui, &s);
             }
         });
     }
@@ -670,19 +1286,71 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // ----- Live timer to drive WPM / elapsed time --------------------------
+    // ----- Live timer to drive WPM / elapsed time and net events ----------
     let live_timer = Timer::default();
     {
         let ui_handle = ui.as_weak();
         let state = state.clone();
         live_timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
-            let s = state.borrow();
-            if let Some(session) = &s.session {
-                if session.start_time.is_some() && !session.is_finished() {
-                    if let Some(ui) = ui_handle.upgrade() {
+            let Some(ui) = ui_handle.upgrade() else {
+                return;
+            };
+            let mut s = state.borrow_mut();
+
+            // ----- Pump net events ------------------------------------------
+            // Drain everything queued so we don't lag behind under load.
+            // `try_iter()` would borrow `s.net` for the duration of the loop,
+            // which prevents us from mutating `s` inside the loop body, so we
+            // collect into a Vec first.
+            let mut events: Vec<NetEvent> = Vec::new();
+            if let Some(net) = s.net.as_ref() {
+                while let Ok(ev) = net.event_rx.try_recv() {
+                    events.push(ev);
+                }
+            }
+            for ev in events {
+                apply_net_event(&ui, &mut s, ev);
+            }
+
+            // ----- Countdown ------------------------------------------------
+            if matches!(s.mode, Mode::Game) && s.game.sub == GameSubState::Countdown {
+                if let Some(started) = s.game.countdown_started_at {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    let remaining = (COUNTDOWN_SECS as f32 - elapsed).ceil() as i32;
+                    if remaining <= 0 {
+                        s.game.sub = GameSubState::Racing;
+                        s.game.countdown_secs = 0;
+                        if let Some(session) = s.session.as_mut() {
+                            session.start_time = Some(Instant::now());
+                        }
+                        ui.invoke_focus_typing();
+                    } else if remaining != s.game.countdown_secs {
+                        s.game.countdown_secs = remaining;
+                    }
+                }
+            }
+
+            // ----- View refresh --------------------------------------------
+            match s.mode {
+                Mode::Lesson(_) | Mode::Practice(_) => {
+                    if let Some(session) = &s.session {
+                        if session.start_time.is_some() && !session.is_finished() {
+                            update_session_view(&ui, &s);
+                        }
+                    }
+                }
+                Mode::Game => {
+                    // Always mirror game state so the lobby's peer list,
+                    // opponent progress bar, countdown number, etc. all stay
+                    // current even when no typing is happening.
+                    refresh_game_view(&ui, &s);
+                    if s.game.sub == GameSubState::Racing
+                        || s.game.sub == GameSubState::Finished
+                    {
                         update_session_view(&ui, &s);
                     }
                 }
+                Mode::Home => {}
             }
         });
     }
