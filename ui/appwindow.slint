@@ -1,0 +1,1076 @@
+// =============================================================================
+//  Keystroke - a typing tutor inspired by Typing Pal / Ten Thumbs
+// =============================================================================
+
+import { Button, ListView, ScrollView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+// -----------------------------------------------------------------------------
+//  Theme & shared types
+// -----------------------------------------------------------------------------
+
+export global Theme {
+    out property <color> bg:              #0f172a;   // app background (slate-900)
+    out property <color> panel:           #1e293b;   // card background (slate-800)
+    out property <color> panel-soft:      #334155;   // raised surface (slate-700)
+    out property <color> divider:         #475569;   // slate-600
+    out property <color> text-primary:    #f8fafc;   // slate-50
+    out property <color> text-secondary:  #94a3b8;   // slate-400
+    out property <color> text-muted:      #64748b;   // slate-500
+    out property <color> accent:          #60a5fa;   // blue-400
+    out property <color> accent-strong:   #2563eb;   // blue-600
+    out property <color> correct:         #4ade80;   // green-400
+    out property <color> incorrect:       #f87171;   // red-400
+    out property <color> cursor-bg:       #fbbf24;   // amber-400 highlight
+    out property <color> cursor-fg:       #0f172a;
+
+    // Colors per finger (index matches the Finger enum on the Rust side)
+    pure public function finger-color(idx: int) -> color {
+        return idx == 0 ? #ef4444    // left pinky  - red
+             : idx == 1 ? #f97316    // left ring   - orange
+             : idx == 2 ? #eab308    // left middle - yellow
+             : idx == 3 ? #84cc16    // left index  - lime
+             : idx == 4 ? #14b8a6    // left thumb  - teal
+             : idx == 5 ? #06b6d4    // right thumb - cyan
+             : idx == 6 ? #3b82f6    // right index - blue
+             : idx == 7 ? #8b5cf6    // right middle- violet
+             : idx == 8 ? #d946ef    // right ring  - fuchsia
+             : idx == 9 ? #ec4899    // right pinky - pink
+             :            #64748b;
+    }
+
+    pure public function finger-name(idx: int) -> string {
+        return idx == 0 ? "Left pinky"
+             : idx == 1 ? "Left ring"
+             : idx == 2 ? "Left middle"
+             : idx == 3 ? "Left index"
+             : idx == 4 ? "Left thumb"
+             : idx == 5 ? "Right thumb"
+             : idx == 6 ? "Right index"
+             : idx == 7 ? "Right middle"
+             : idx == 8 ? "Right ring"
+             : idx == 9 ? "Right pinky"
+             :            "";
+    }
+}
+
+// Page identifier - mirrored in Rust
+export enum AppPage { home, lessons, practice }
+
+// State of a single character cell:
+//   0 = untyped, 1 = correct, 2 = wrong, 3 = current (cursor)
+export struct CharCell {
+    character: string,
+    state: int,
+    finger: int,
+}
+
+export struct CharRow {
+    cells: [CharCell],
+}
+
+// One row of the virtual keyboard
+export struct KeyDef {
+    label: string,         // visible label
+    key-char: string,      // lowercase character it represents (for matching)
+    width: float,          // multiple of the unit key width
+    finger: int,
+}
+
+// One picker item (lesson or sample text in the sidebar)
+export struct PickerItem {
+    title: string,
+    subtitle: string,
+    completed: bool,
+}
+
+// -----------------------------------------------------------------------------
+//  Typing area: shows the target text with per-character color feedback
+// -----------------------------------------------------------------------------
+
+component CharGlyph inherits Rectangle {
+    in property <CharCell> cell;
+    width: 18px;
+    height: 34px;
+    border-radius: 4px;
+    background: cell.state == 3 ? Theme.cursor-bg : transparent;
+
+    Text {
+        text: root.cell.character == " " ? "·" : root.cell.character;
+        color: root.cell.state == 0 ? Theme.text-muted
+             : root.cell.state == 1 ? Theme.correct
+             : root.cell.state == 2 ? Theme.incorrect
+             : Theme.cursor-fg;
+        font-size: 24px;
+        font-weight: root.cell.state == 3 ? 700 : 500;
+        font-family: "Consolas, Courier New, monospace";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component TypingArea inherits Rectangle {
+    in property <[CharRow]> rows;
+
+    background: Theme.panel;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.divider;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 6px;
+        alignment: center;
+        for row in root.rows : HorizontalLayout {
+            alignment: center;
+            spacing: 0px;
+            for cell in row.cells : CharGlyph { cell: cell; }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Virtual keyboard
+// -----------------------------------------------------------------------------
+
+component Key inherits Rectangle {
+    in property <string> label;
+    in property <string> key-char;     // lowercase form, "" if non-typable
+    in property <float>  width-units: 1.0;
+    in property <int>    finger: -1;
+    in property <string> next-key;
+    in property <string> pressed-key;
+
+    property <bool> is-next:    root.key-char != "" && root.key-char == root.next-key;
+    property <bool> is-pressed: root.key-char != "" && root.key-char == root.pressed-key;
+    property <color> base-color: Theme.finger-color(root.finger);
+
+    width: root.width-units * 44px;
+    height: 44px;
+    border-radius: 6px;
+
+    background: root.is-pressed ? root.base-color.brighter(0.5)
+              : root.is-next    ? root.base-color
+              : root.base-color.darker(0.55);
+    border-width: root.is-next ? 2px : 1px;
+    border-color: root.is-next ? Theme.text-primary : #00000055;
+    drop-shadow-blur:  root.is-next ? 16px : 0px;
+    drop-shadow-color: root.base-color;
+
+    animate background       { duration: 120ms; easing: ease-in-out; }
+    animate border-color     { duration: 120ms; }
+    animate drop-shadow-blur { duration: 200ms; }
+
+    Text {
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 13px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component VirtualKeyboard inherits Rectangle {
+    in property <string> next-key;
+    in property <string> pressed-key;
+
+    // Row definitions — each list is a row of the keyboard.
+    property <[KeyDef]> row1: [
+        { label: "`",  key-char: "`", width: 1.0, finger: 0 },
+        { label: "1",  key-char: "1", width: 1.0, finger: 0 },
+        { label: "2",  key-char: "2", width: 1.0, finger: 1 },
+        { label: "3",  key-char: "3", width: 1.0, finger: 2 },
+        { label: "4",  key-char: "4", width: 1.0, finger: 3 },
+        { label: "5",  key-char: "5", width: 1.0, finger: 3 },
+        { label: "6",  key-char: "6", width: 1.0, finger: 6 },
+        { label: "7",  key-char: "7", width: 1.0, finger: 6 },
+        { label: "8",  key-char: "8", width: 1.0, finger: 7 },
+        { label: "9",  key-char: "9", width: 1.0, finger: 8 },
+        { label: "0",  key-char: "0", width: 1.0, finger: 9 },
+        { label: "-",  key-char: "-", width: 1.0, finger: 9 },
+        { label: "=",  key-char: "=", width: 1.0, finger: 9 },
+        { label: "⌫",  key-char: "", width: 2.0, finger: 9 },
+    ];
+
+    property <[KeyDef]> row2: [
+        { label: "Tab", key-char: "", width: 1.5, finger: 0 },
+        { label: "Q",   key-char: "q", width: 1.0, finger: 0 },
+        { label: "W",   key-char: "w", width: 1.0, finger: 1 },
+        { label: "E",   key-char: "e", width: 1.0, finger: 2 },
+        { label: "R",   key-char: "r", width: 1.0, finger: 3 },
+        { label: "T",   key-char: "t", width: 1.0, finger: 3 },
+        { label: "Y",   key-char: "y", width: 1.0, finger: 6 },
+        { label: "U",   key-char: "u", width: 1.0, finger: 6 },
+        { label: "I",   key-char: "i", width: 1.0, finger: 7 },
+        { label: "O",   key-char: "o", width: 1.0, finger: 8 },
+        { label: "P",   key-char: "p", width: 1.0, finger: 9 },
+        { label: "[",   key-char: "[", width: 1.0, finger: 9 },
+        { label: "]",   key-char: "]", width: 1.0, finger: 9 },
+        { label: "\\",  key-char: "\\", width: 1.5, finger: 9 },
+    ];
+
+    property <[KeyDef]> row3: [
+        { label: "Caps", key-char: "", width: 1.75, finger: 0 },
+        { label: "A",    key-char: "a", width: 1.0, finger: 0 },
+        { label: "S",    key-char: "s", width: 1.0, finger: 1 },
+        { label: "D",    key-char: "d", width: 1.0, finger: 2 },
+        { label: "F",    key-char: "f", width: 1.0, finger: 3 },
+        { label: "G",    key-char: "g", width: 1.0, finger: 3 },
+        { label: "H",    key-char: "h", width: 1.0, finger: 6 },
+        { label: "J",    key-char: "j", width: 1.0, finger: 6 },
+        { label: "K",    key-char: "k", width: 1.0, finger: 7 },
+        { label: "L",    key-char: "l", width: 1.0, finger: 8 },
+        { label: ";",    key-char: ";", width: 1.0, finger: 9 },
+        { label: "'",    key-char: "'", width: 1.0, finger: 9 },
+        { label: "Enter",key-char: "", width: 2.25, finger: 9 },
+    ];
+
+    property <[KeyDef]> row4: [
+        { label: "Shift", key-char: "", width: 2.25, finger: 0 },
+        { label: "Z",     key-char: "z", width: 1.0, finger: 0 },
+        { label: "X",     key-char: "x", width: 1.0, finger: 1 },
+        { label: "C",     key-char: "c", width: 1.0, finger: 2 },
+        { label: "V",     key-char: "v", width: 1.0, finger: 3 },
+        { label: "B",     key-char: "b", width: 1.0, finger: 3 },
+        { label: "N",     key-char: "n", width: 1.0, finger: 6 },
+        { label: "M",     key-char: "m", width: 1.0, finger: 6 },
+        { label: ",",     key-char: ",", width: 1.0, finger: 7 },
+        { label: ".",     key-char: ".", width: 1.0, finger: 8 },
+        { label: "/",     key-char: "/", width: 1.0, finger: 9 },
+        { label: "Shift", key-char: "", width: 2.75, finger: 9 },
+    ];
+
+    property <[KeyDef]> row5: [
+        { label: "Ctrl",  key-char: "", width: 1.5, finger: 0 },
+        { label: "Alt",   key-char: "", width: 1.25, finger: 0 },
+        { label: "Space", key-char: " ", width: 8.0, finger: 5 },
+        { label: "Alt",   key-char: "", width: 1.25, finger: 9 },
+        { label: "Ctrl",  key-char: "", width: 1.5, finger: 9 },
+    ];
+
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 5px;
+        alignment: center;
+        padding: 8px;
+
+        HorizontalLayout { spacing: 5px; alignment: center;
+            for k in root.row1 : Key {
+                label: k.label; key-char: k.key-char; width-units: k.width; finger: k.finger;
+                next-key: root.next-key; pressed-key: root.pressed-key;
+            }
+        }
+        HorizontalLayout { spacing: 5px; alignment: center;
+            for k in root.row2 : Key {
+                label: k.label; key-char: k.key-char; width-units: k.width; finger: k.finger;
+                next-key: root.next-key; pressed-key: root.pressed-key;
+            }
+        }
+        HorizontalLayout { spacing: 5px; alignment: center;
+            for k in root.row3 : Key {
+                label: k.label; key-char: k.key-char; width-units: k.width; finger: k.finger;
+                next-key: root.next-key; pressed-key: root.pressed-key;
+            }
+        }
+        HorizontalLayout { spacing: 5px; alignment: center;
+            for k in root.row4 : Key {
+                label: k.label; key-char: k.key-char; width-units: k.width; finger: k.finger;
+                next-key: root.next-key; pressed-key: root.pressed-key;
+            }
+        }
+        HorizontalLayout { spacing: 5px; alignment: center;
+            for k in root.row5 : Key {
+                label: k.label; key-char: k.key-char; width-units: k.width; finger: k.finger;
+                next-key: root.next-key; pressed-key: root.pressed-key;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Hands display: stylised left/right hand silhouettes with finger highlighting
+// -----------------------------------------------------------------------------
+
+component HandFinger inherits Rectangle {
+    in property <int> finger-index;
+    in property <int> active-finger;
+    in property <int> pressed-finger;
+
+    property <color> base-color: Theme.finger-color(root.finger-index);
+    property <bool>  is-active:  root.finger-index == root.active-finger;
+    property <bool>  is-pressed: root.finger-index == root.pressed-finger;
+
+    border-radius: 9px;
+    background: root.is-pressed ? root.base-color.brighter(0.6)
+              : root.is-active  ? root.base-color
+              : root.base-color.darker(0.55);
+    border-width: root.is-active ? 2px : 0px;
+    border-color: Theme.text-primary;
+    drop-shadow-blur:  root.is-active ? 14px : 0px;
+    drop-shadow-color: root.base-color;
+
+    animate background       { duration: 150ms; easing: ease-in-out; }
+    animate border-color     { duration: 150ms; }
+    animate drop-shadow-blur { duration: 200ms; }
+}
+
+component Hand inherits Rectangle {
+    in property <int>  active-finger;
+    in property <int>  pressed-finger;
+    in property <bool> is-right;
+    width: 230px;
+    height: 150px;
+
+    // Palm
+    Rectangle {
+        x: 12px;
+        y: 118px;
+        width: 206px;
+        height: 28px;
+        border-radius: 12px;
+        background: Theme.panel-soft;
+        border-width: 1px;
+        border-color: Theme.divider;
+    }
+
+    // ---- Left-hand fingers (only shown when !is-right) ---------------------
+    if !root.is-right : HandFinger {
+        x: 14px; y: 60px; width: 28px; height: 60px;
+        finger-index: 0; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if !root.is-right : HandFinger {
+        x: 50px; y: 36px; width: 28px; height: 84px;
+        finger-index: 1; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if !root.is-right : HandFinger {
+        x: 86px; y: 18px; width: 28px; height: 102px;
+        finger-index: 2; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if !root.is-right : HandFinger {
+        x: 122px; y: 30px; width: 28px; height: 90px;
+        finger-index: 3; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if !root.is-right : HandFinger {
+        x: 162px; y: 70px; width: 38px; height: 52px;
+        finger-index: 4; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+
+    // ---- Right-hand fingers (mirror) ---------------------------------------
+    if root.is-right : HandFinger {
+        x: 30px; y: 70px; width: 38px; height: 52px;
+        finger-index: 5; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if root.is-right : HandFinger {
+        x: 80px; y: 30px; width: 28px; height: 90px;
+        finger-index: 6; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if root.is-right : HandFinger {
+        x: 116px; y: 18px; width: 28px; height: 102px;
+        finger-index: 7; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if root.is-right : HandFinger {
+        x: 152px; y: 36px; width: 28px; height: 84px;
+        finger-index: 8; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+    if root.is-right : HandFinger {
+        x: 188px; y: 60px; width: 28px; height: 60px;
+        finger-index: 9; active-finger: root.active-finger; pressed-finger: root.pressed-finger;
+    }
+}
+
+component HandsDisplay inherits Rectangle {
+    in property <int> active-finger;
+    in property <int> pressed-finger;
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 32px;
+        Hand {
+            is-right: false;
+            active-finger: root.active-finger;
+            pressed-finger: root.pressed-finger;
+        }
+        Hand {
+            is-right: true;
+            active-finger: root.active-finger;
+            pressed-finger: root.pressed-finger;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Stats bar (WPM / accuracy / time / errors / progress)
+// -----------------------------------------------------------------------------
+
+component StatTile inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <color>  value-color: Theme.text-primary;
+
+    background: Theme.panel-soft;
+    border-radius: 10px;
+    height: 64px;
+    min-width: 120px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 2px;
+        alignment: center;
+        Text {
+            text: root.label;
+            color: Theme.text-secondary;
+            font-size: 11px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.value;
+            color: root.value-color;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+component StatsBar inherits Rectangle {
+    in property <string> wpm-text:      "0";
+    in property <string> accuracy-text: "100%";
+    in property <string> time-text:     "0.0s";
+    in property <string> errors-text:   "0";
+    in property <float>  progress:      0;
+
+    height: 96px;
+
+    VerticalLayout {
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 12px;
+            StatTile { label: "WPM";      value: root.wpm-text;      value-color: Theme.accent; }
+            StatTile { label: "Accuracy"; value: root.accuracy-text; value-color: Theme.correct; }
+            StatTile { label: "Time";     value: root.time-text; }
+            StatTile { label: "Errors";   value: root.errors-text;   value-color: Theme.incorrect; }
+        }
+        // Progress bar
+        Rectangle {
+            height: 6px;
+            border-radius: 3px;
+            background: Theme.panel-soft;
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width * root.progress;
+                height: parent.height;
+                border-radius: 3px;
+                background: Theme.accent;
+                animate width { duration: 120ms; easing: ease-out; }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Sidebar with pickable items (lessons / sample texts)
+// -----------------------------------------------------------------------------
+
+component PickerRow inherits Rectangle {
+    in property <PickerItem> item;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 64px;
+    border-radius: 8px;
+    background: root.selected ? Theme.accent-strong : (touch.has-hover ? Theme.panel-soft : transparent);
+    animate background { duration: 100ms; }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    HorizontalLayout {
+        padding: 12px;
+        spacing: 10px;
+        alignment: start;
+
+        // bullet / checkmark
+        Rectangle {
+            width: 24px; height: 24px;
+            border-radius: 12px;
+            background: root.item.completed ? Theme.correct : Theme.panel-soft;
+            border-width: 1px;
+            border-color: Theme.divider;
+            y: (parent.height - 24px) / 2;
+            Text {
+                text: root.item.completed ? "✓" : "";
+                color: Theme.bg;
+                font-size: 14px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+
+        VerticalLayout {
+            spacing: 2px;
+            alignment: center;
+            Text {
+                text: root.item.title;
+                color: Theme.text-primary;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+            }
+            Text {
+                text: root.item.subtitle;
+                color: Theme.text-secondary;
+                font-size: 11px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Reusable "card" button used on the home page
+// -----------------------------------------------------------------------------
+
+component NavCard inherits Rectangle {
+    in property <string> icon;
+    in property <string> title;
+    in property <string> subtitle;
+    callback clicked();
+
+    width: 240px;
+    height: 220px;
+    border-radius: 16px;
+    background: touch.has-hover ? Theme.panel-soft : Theme.panel;
+    border-width: 1px;
+    border-color: touch.has-hover ? Theme.accent : Theme.divider;
+    drop-shadow-blur: touch.has-hover ? 24px : 0px;
+    drop-shadow-color: Theme.accent;
+    animate background, border-color, drop-shadow-blur { duration: 180ms; easing: ease-out; }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 14px;
+        alignment: center;
+        Text {
+            text: root.icon;
+            font-size: 64px;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.title;
+            color: Theme.text-primary;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.subtitle;
+            color: Theme.text-secondary;
+            font-size: 13px;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Top bar with title and navigation
+// -----------------------------------------------------------------------------
+
+component TopBar inherits Rectangle {
+    in property <AppPage> current-page;
+    callback nav-home();
+    callback nav-lessons();
+    callback nav-practice();
+
+    height: 56px;
+    background: Theme.panel;
+    border-width: 0px;
+
+    HorizontalLayout {
+        padding-left: 24px;
+        padding-right: 24px;
+        spacing: 16px;
+        alignment: start;
+
+        // logo / app name
+        TouchArea {
+            width: 200px;
+            clicked => { root.nav-home(); }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+                Text {
+                    text: "⌨";
+                    color: Theme.accent;
+                    font-size: 26px;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: "Keystroke";
+                    color: Theme.text-primary;
+                    font-size: 20px;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // spacer
+        Rectangle { horizontal-stretch: 1; }
+
+        // nav items
+        TouchArea {
+            width: 100px;
+            clicked => { root.nav-home(); }
+            Rectangle {
+                background: root.current-page == AppPage.home ? Theme.panel-soft : transparent;
+                border-radius: 8px;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "Home";
+                    color: root.current-page == AppPage.home ? Theme.accent : Theme.text-secondary;
+                    font-size: 14px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        TouchArea {
+            width: 100px;
+            clicked => { root.nav-lessons(); }
+            Rectangle {
+                background: root.current-page == AppPage.lessons ? Theme.panel-soft : transparent;
+                border-radius: 8px;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "Lessons";
+                    color: root.current-page == AppPage.lessons ? Theme.accent : Theme.text-secondary;
+                    font-size: 14px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        TouchArea {
+            width: 100px;
+            clicked => { root.nav-practice(); }
+            Rectangle {
+                background: root.current-page == AppPage.practice ? Theme.panel-soft : transparent;
+                border-radius: 8px;
+                animate background { duration: 120ms; }
+                Text {
+                    text: "Practice";
+                    color: root.current-page == AppPage.practice ? Theme.accent : Theme.text-secondary;
+                    font-size: 14px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Home page
+// -----------------------------------------------------------------------------
+
+component HomePage inherits Rectangle {
+    in property <string> last-result-text;
+    callback nav-lessons();
+    callback nav-practice();
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 24px;
+        padding: 32px;
+
+        Text {
+            text: "Welcome to Keystroke";
+            color: Theme.text-primary;
+            font-size: 38px;
+            font-weight: 800;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Learn touch typing the right way — at your own pace.";
+            color: Theme.text-secondary;
+            font-size: 16px;
+            horizontal-alignment: center;
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 24px;
+            NavCard {
+                icon: "📚";
+                title: "Lessons";
+                subtitle: "Eight step-by-step lessons that teach you the entire keyboard one finger at a time.";
+                clicked => { root.nav-lessons(); }
+            }
+            NavCard {
+                icon: "⚡";
+                title: "Practice";
+                subtitle: "Pick a sample text and measure your speed and accuracy in a free typing test.";
+                clicked => { root.nav-practice(); }
+            }
+            NavCard {
+                icon: "🎯";
+                title: "Your Best";
+                subtitle: root.last-result-text;
+                // No callback - decorative card
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Shared typing-session page (used by both Lessons and Practice)
+// -----------------------------------------------------------------------------
+
+component SessionPanel inherits Rectangle {
+    in property <string>      title-text;
+    in property <string>      description-text;
+    in property <string>      finger-hint;
+    in property <int>         finger-hint-index;
+    in property <[CharRow]>   rows;
+    in property <string>      next-key;
+    in property <string>      pressed-key;
+    in property <int>         active-finger;
+    in property <int>         pressed-finger;
+    in property <string>      wpm-text;
+    in property <string>      accuracy-text;
+    in property <string>      time-text;
+    in property <string>      errors-text;
+    in property <float>       progress;
+    in property <bool>        finished;
+    in property <string>      result-summary;
+    callback restart();
+    callback next-item();
+    callback request-focus();
+
+    background: Theme.bg;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 14px;
+
+        // Header
+        VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: root.title-text;
+                color: Theme.text-primary;
+                font-size: 22px;
+                font-weight: 700;
+            }
+            Text {
+                text: root.description-text;
+                color: Theme.text-secondary;
+                font-size: 13px;
+                wrap: word-wrap;
+            }
+        }
+
+        // Live stats
+        StatsBar {
+            wpm-text:      root.wpm-text;
+            accuracy-text: root.accuracy-text;
+            time-text:     root.time-text;
+            errors-text:   root.errors-text;
+            progress:      root.progress;
+        }
+
+        // Typing area
+        TypingArea {
+            rows: root.rows;
+            min-height: 110px;
+            preferred-height: 130px;
+            // Tap to refocus
+            TouchArea { clicked => { root.request-focus(); } }
+        }
+
+        // Finger hint
+        Rectangle {
+            height: 28px;
+            HorizontalLayout {
+                spacing: 10px;
+                alignment: center;
+                Rectangle {
+                    width: 16px; height: 16px;
+                    border-radius: 8px;
+                    background: Theme.finger-color(root.finger-hint-index);
+                    y: (parent.height - 16px) / 2;
+                }
+                Text {
+                    text: root.finger-hint;
+                    color: Theme.text-secondary;
+                    font-size: 13px;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Keyboard
+        VirtualKeyboard {
+            next-key: root.next-key;
+            pressed-key: root.pressed-key;
+            min-height: 250px;
+            preferred-height: 250px;
+        }
+
+        // Hands
+        HandsDisplay {
+            active-finger: root.active-finger;
+            pressed-finger: root.pressed-finger;
+            min-height: 160px;
+        }
+
+        // Finished overlay (inline)
+        if root.finished : Rectangle {
+            height: 84px;
+            border-radius: 12px;
+            background: Theme.panel;
+            border-width: 2px;
+            border-color: Theme.correct;
+            HorizontalLayout {
+                padding: 16px;
+                spacing: 16px;
+                alignment: center;
+                Text {
+                    text: "🎉";
+                    font-size: 36px;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: "Well done!";
+                        color: Theme.correct;
+                        font-size: 18px;
+                        font-weight: 700;
+                    }
+                    Text {
+                        text: root.result-summary;
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "Retry";
+                    clicked => { root.restart(); }
+                }
+                Button {
+                    text: "Next ▶";
+                    primary: true;
+                    clicked => { root.next-item(); }
+                }
+            }
+        }
+    }
+}
+
+component PickerSidebar inherits Rectangle {
+    in property <string>        header-text;
+    in property <[PickerItem]>  items;
+    in property <int>           selected-index;
+    callback item-clicked(int);
+
+    width: 280px;
+    background: Theme.panel;
+    border-width: 0px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: root.header-text;
+            color: Theme.text-primary;
+            font-size: 16px;
+            font-weight: 700;
+        }
+
+        ScrollView {
+            VerticalLayout {
+                spacing: 4px;
+                for item[i] in root.items : PickerRow {
+                    item: item;
+                    selected: i == root.selected-index;
+                    clicked => { root.item-clicked(i); }
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Main window
+// -----------------------------------------------------------------------------
+
+export component AppWindow inherits Window {
+    title: "Keystroke - Learn to Type";
+    preferred-width: 1280px;
+    preferred-height: 880px;
+    min-width: 1100px;
+    min-height: 800px;
+    background: Theme.bg;
+
+    // ----- Navigation ----------------------------------------------------
+    in property <AppPage> page: AppPage.home;
+    callback nav-home();
+    callback nav-lessons();
+    callback nav-practice();
+
+    // ----- Home --------------------------------------------------------
+    in property <string> last-result-text: "Complete a typing test to see your best result here.";
+
+    // ----- Session-shared (applies to whichever session is active) -----
+    in property <string>     session-title;
+    in property <string>     session-description;
+    in property <string>     finger-hint:        "Press any key to start";
+    in property <int>        finger-hint-index:  -1;
+    in property <[CharRow]>  rows:               [];
+    in property <string>     next-key;
+    in property <string>     pressed-key;
+    in property <int>        active-finger:      -1;
+    in property <int>        pressed-finger:     -1;
+    in property <string>     wpm-text:           "0";
+    in property <string>     accuracy-text:      "100%";
+    in property <string>     time-text:          "0.0s";
+    in property <string>     errors-text:        "0";
+    in property <float>      progress:           0;
+    in property <bool>       finished:           false;
+    in property <string>     result-summary:     "";
+
+    // ----- Pickers -----------------------------------------------------
+    in property <[PickerItem]> lessons-list;
+    in property <int>          lessons-selected-index;
+    in property <[PickerItem]> texts-list;
+    in property <int>          texts-selected-index;
+    callback lesson-clicked(int);
+    callback text-clicked(int);
+
+    // ----- Typing controls --------------------------------------------
+    callback key-typed(string);
+    callback backspace();
+    callback restart();
+    callback next-item();
+
+    // Focus capture
+    public function focus-typing() {
+        focus-scope.focus();
+    }
+
+    // ----- Root layout ------------------------------------------------
+    VerticalLayout {
+        TopBar {
+            current-page: root.page;
+            nav-home    => { root.nav-home(); }
+            nav-lessons => { root.nav-lessons(); }
+            nav-practice=> { root.nav-practice(); }
+        }
+
+        // Divider
+        Rectangle { height: 1px; background: Theme.divider; }
+
+        // Content area
+        focus-scope := FocusScope {
+            key-pressed(event) => {
+                // Backspace: per Slint constants
+                if (event.text == Key.Backspace) {
+                    root.backspace();
+                    return accept;
+                }
+                // Ignore control / navigation keys (Tab, arrows, etc.)
+                if (event.text == Key.Tab || event.text == Key.Return || event.text == Key.Escape) {
+                    return reject;
+                }
+                if (event.text != "") {
+                    root.key-typed(event.text);
+                }
+                return accept;
+            }
+
+            if root.page == AppPage.home : HomePage {
+                last-result-text: root.last-result-text;
+                nav-lessons => { root.nav-lessons(); }
+                nav-practice => { root.nav-practice(); }
+            }
+
+            if root.page == AppPage.lessons : HorizontalLayout {
+                PickerSidebar {
+                    header-text: "Lessons";
+                    items: root.lessons-list;
+                    selected-index: root.lessons-selected-index;
+                    item-clicked(i) => { root.lesson-clicked(i); }
+                }
+                Rectangle { width: 1px; background: Theme.divider; }
+                SessionPanel {
+                    title-text: root.session-title;
+                    description-text: root.session-description;
+                    finger-hint: root.finger-hint;
+                    finger-hint-index: root.finger-hint-index;
+                    rows: root.rows;
+                    next-key: root.next-key;
+                    pressed-key: root.pressed-key;
+                    active-finger: root.active-finger;
+                    pressed-finger: root.pressed-finger;
+                    wpm-text: root.wpm-text;
+                    accuracy-text: root.accuracy-text;
+                    time-text: root.time-text;
+                    errors-text: root.errors-text;
+                    progress: root.progress;
+                    finished: root.finished;
+                    result-summary: root.result-summary;
+                    restart => { root.restart(); }
+                    next-item => { root.next-item(); }
+                    request-focus => { root.focus-typing(); }
+                }
+            }
+
+            if root.page == AppPage.practice : HorizontalLayout {
+                PickerSidebar {
+                    header-text: "Sample Texts";
+                    items: root.texts-list;
+                    selected-index: root.texts-selected-index;
+                    item-clicked(i) => { root.text-clicked(i); }
+                }
+                Rectangle { width: 1px; background: Theme.divider; }
+                SessionPanel {
+                    title-text: root.session-title;
+                    description-text: root.session-description;
+                    finger-hint: root.finger-hint;
+                    finger-hint-index: root.finger-hint-index;
+                    rows: root.rows;
+                    next-key: root.next-key;
+                    pressed-key: root.pressed-key;
+                    active-finger: root.active-finger;
+                    pressed-finger: root.pressed-finger;
+                    wpm-text: root.wpm-text;
+                    accuracy-text: root.accuracy-text;
+                    time-text: root.time-text;
+                    errors-text: root.errors-text;
+                    progress: root.progress;
+                    finished: root.finished;
+                    result-summary: root.result-summary;
+                    restart => { root.restart(); }
+                    next-item => { root.next-item(); }
+                    request-focus => { root.focus-typing(); }
+                }
+            }
+        }
+    }
+}

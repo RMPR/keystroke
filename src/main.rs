@@ -1,287 +1,629 @@
-use iced::widget::{button, column, container, text, text_input, Column};
-use once_cell::sync::Lazy;
+//! Keystroke — a typing tutor built with Slint.
 
-static INPUT_ID: Lazy<text_input::Id> = Lazy::new(text_input::Id::unique);
-use iced::{executor, Application, Command, Element, Length, Settings, Subscription, Theme};
-use std::time::Instant;
+mod finger;
+mod lessons;
+mod texts;
 
-// --- Main Application State ---
-struct TypingTutor {
-    status: Status,
-    sample_text: String,
-    current_input: String,
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use slint::{ModelRc, Timer, TimerMode, VecModel};
+
+use finger::{finger_for_char, Finger};
+
+slint::include_modules!();
+
+// ---------------------------------------------------------------------------
+//  Domain model
+// ---------------------------------------------------------------------------
+
+/// Currently displayed page / mode of the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Home,
+    Lesson(usize),
+    Practice(usize),
+}
+
+/// An active typing session.
+struct Session {
+    target: Vec<char>,
+    typed: Vec<char>,
+    /// Total number of incorrect keystrokes (including ones later corrected).
+    errors: usize,
     start_time: Option<Instant>,
-    results: Option<TypingResult>,
+    finished_at: Option<Instant>,
 }
 
-// --- Application Status ---
-#[derive(Debug, Clone, PartialEq)]
-enum Status {
-    Ready,
-    Typing,
-    Finished,
-}
-
-// --- Calculation Result ---
-#[derive(Debug, Clone)]
-struct TypingResult {
-    wpm: f64,
-    accuracy: f64,
-    duration: f64,
-}
-
-// --- Messages to update state ---
-// These are triggered by user interactions or other events
-#[derive(Debug, Clone)]
-enum Message {
-    StartTyping,
-    InputChanged(String),
-    FocusNext,
-    FocusPrevious,
-    // Could add Reset, LoadLesson, etc. in a real app
-}
-
-// --- Application Implementation ---
-// The core logic resides here, handling state and UI updates
-impl Application for TypingTutor {
-    type Executor = executor::Default; // Specifies how async operations are run
-    type Message = Message; // The type of messages this app handles
-    type Theme = Theme; // The theme type (e.g., Light, Dark)
-    type Flags = (); // Data passed during initialization (none here)
-
-    // Initialize the application state
-    fn new(_flags: ()) -> (Self, Command<Message>) {
-        (
-            Self {
-                status: Status::Ready,
-                // Using a shorter text for this basic GUI demo
-                sample_text: "the quick brown fox".to_string(),
-                current_input: "".to_string(),
-                start_time: None,
-                results: None,
-            },
-            Command::none(), // No initial commands to run
-        )
-    }
-
-    // Sets the window title
-    fn title(&self) -> String {
-        String::from("Rust GUI Typing Tutor - Iced Demo")
-    }
-
-    // Handles messages and updates the application state
-    fn update(&mut self, message: Message) -> Command<Message> {
-        // Tab navigation is allowed regardless of the current status.
-        match message {
-            Message::FocusNext => return iced::widget::focus_next(),
-            Message::FocusPrevious => return iced::widget::focus_previous(),
-            _ => {}
+impl Session {
+    fn new(text: &str) -> Self {
+        Self {
+            target: text.chars().collect(),
+            typed: Vec::new(),
+            errors: 0,
+            start_time: None,
+            finished_at: None,
         }
+    }
 
-        match self.status {
-            Status::Ready => {
-                if let Message::StartTyping = message {
-                    self.status = Status::Typing;
-                    self.current_input.clear();
-                    self.results = None;
-                    self.start_time = None;
-                    return text_input::focus(INPUT_ID.clone());
-                }
-            }
-            Status::Typing => {
-                if let Message::InputChanged(value) = message {
-                    // Start the timer on the very first keystroke
-                    if self.start_time.is_none() {
-                        self.start_time = Some(Instant::now());
-                    }
-                    self.current_input = value;
+    fn position(&self) -> usize {
+        self.typed.len()
+    }
 
-                    // VERY basic finish condition: input reaches sample length.
-                    // A real app needs a better way (e.g., detect Enter press, timeout, finish button).
-                    // Also lacks real-time validation/highlighting.
-                    if self.current_input.len() >= self.sample_text.len() {
-                        // Truncate if user typed more (simple handling)
-                        self.current_input =
-                            self.current_input[..self.sample_text.len()].to_string();
-                        self.status = Status::Finished;
-                        if let Some(start_time) = self.start_time {
-                            let duration = start_time.elapsed();
-                            let results = calculate_results(
-                                &self.sample_text,
-                                &self.current_input,
-                                duration.as_secs_f64(),
-                            );
-                            self.results = Some(results);
-                        }
-                    }
-                }
-            }
-            Status::Finished => {
-                // Allow restarting the test
-                if let Message::StartTyping = message {
-                    self.status = Status::Typing;
-                    self.current_input.clear();
-                    self.results = None;
-                    self.start_time = None;
-                    return text_input::focus(INPUT_ID.clone());
-                }
-            }
+    fn is_finished(&self) -> bool {
+        self.finished_at.is_some()
+    }
+
+    fn elapsed_secs(&self, now: Instant) -> f64 {
+        match (self.start_time, self.finished_at) {
+            (Some(s), Some(f)) => (f - s).as_secs_f64(),
+            (Some(s), None) => (now - s).as_secs_f64(),
+            _ => 0.0,
         }
-        Command::none() // No async commands returned by default
     }
 
-    // Defines the UI layout based on the current state
-    fn view(&self) -> Element<Message> {
-        // Use a Column layout to stack widgets vertically
-        let mut col = Column::new()
-            .spacing(10)
-            .padding(20)
-            .align_items(iced::Alignment::Center);
+    fn correct_chars(&self) -> usize {
+        self.typed
+            .iter()
+            .zip(self.target.iter())
+            .filter(|(a, b)| a == b)
+            .count()
+    }
 
-        // --- Display Sample Text ---
-        col = col.push(text("Type the following text:").size(20));
-        // A real app would use better text rendering (e.g., highlighting typed parts)
-        col = col.push(text(&self.sample_text).size(24));
-
-        // --- Display Input Field ---
-        // The placeholder changes based on state
-        let placeholder = match self.status {
-            Status::Ready => "Click 'Start Typing!' to begin",
-            Status::Typing => "Start typing here...",
-            Status::Finished => "Test finished!",
-        };
-
-        let input_field = text_input(placeholder, &self.current_input)
-            .id(INPUT_ID.clone())
-            .padding(10);
-
-        // Only allow input changes when in Typing state
-        let active_input_field = if self.status == Status::Typing {
-            input_field.on_input(Message::InputChanged)
-        } else {
-            input_field // Effectively read-only as on_input is missing
-        };
-        col = col.push(active_input_field);
-
-        // --- Display Button ---
-        let (button_text, button_message) = match self.status {
-            Status::Ready => ("Start Typing!", Some(Message::StartTyping)),
-            Status::Typing => ("Typing...", None), // Disable button press while typing
-            Status::Finished => ("Restart Test", Some(Message::StartTyping)),
-        };
-
-        col = col.push(
-            button(text(button_text).horizontal_alignment(iced::alignment::Horizontal::Center))
-                .padding(10)
-                .width(Length::Fixed(150.0)) // Give button fixed width
-                .on_press_maybe(button_message), // `on_press_maybe` handles Option<Message>
-        );
-
-        // --- Display Results Area ---
-        if let Some(results) = &self.results {
-            // Only show results when finished
-            if self.status == Status::Finished {
-                col = col.push(
-                    text("--- Results ---")
-                        .size(20)
-                        .style(iced::theme::Text::Default),
-                ); // Use theme color
-                col = col.push(text(format!("Time: {:.2} s", results.duration)));
-                col = col.push(text(format!("Accuracy: {:.2}%", results.accuracy)));
-                col = col.push(text(format!("WPM: {:.2}", results.wpm)));
-            }
+    fn wpm(&self, now: Instant) -> f64 {
+        let secs = self.elapsed_secs(now);
+        if secs < 0.05 {
+            return 0.0;
         }
-
-        // --- Final Layout ---
-        // Wrap the column in a container for centering and filling space
-        container(col)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x()
-            .center_y()
-            .into() // Convert to Element
+        // Standard "net WPM" using correctly-typed characters / 5.
+        (self.correct_chars() as f64 / 5.0) / (secs / 60.0)
     }
 
-    // Use the default theme (Light)
-    fn theme(&self) -> Self::Theme {
-        Theme::default()
+    fn accuracy(&self) -> f64 {
+        // Net accuracy: correctly typed characters divided by the total number
+        // of keystrokes (including ones that were wrong and later corrected).
+        if self.typed.is_empty() {
+            return 100.0;
+        }
+        let correct = self.correct_chars();
+        let denominator = correct + self.errors;
+        if denominator == 0 {
+            return 100.0;
+        }
+        (correct as f64 / denominator as f64) * 100.0
     }
+}
 
-    // Listen for Tab / Shift+Tab key presses globally to move keyboard focus
-    // between focusable widgets.
-    fn subscription(&self) -> Subscription<Message> {
-        iced::event::listen_with(|event, status| {
-            // Only react to events that haven't already been consumed by a widget.
-            if status != iced::event::Status::Ignored {
-                return None;
-            }
-            if let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Tab),
-                modifiers,
-                ..
-            }) = event
-            {
-                if modifiers.shift() {
-                    Some(Message::FocusPrevious)
+struct AppState {
+    mode: Mode,
+    session: Option<Session>,
+    lessons_completed: HashSet<usize>,
+    best_wpm: Option<f64>,
+    last_lesson_index: usize,
+    last_text_index: usize,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            mode: Mode::Home,
+            session: None,
+            lessons_completed: HashSet::new(),
+            best_wpm: None,
+            last_lesson_index: 0,
+            last_text_index: 0,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers — text wrapping & UI building
+// ---------------------------------------------------------------------------
+
+/// Wraps a text into rows that each contain no more than `max_chars`
+/// characters, breaking at word boundaries when possible.
+/// Returns a list of (start_index, line_chars) pairs so the caller knows
+/// where each row begins in the original character index.
+fn wrap_indices(target: &[char], max_chars: usize) -> Vec<std::ops::Range<usize>> {
+    let mut rows = Vec::new();
+    let mut row_start = 0usize;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0usize;
+    while i < target.len() {
+        let len_so_far = i - row_start + 1;
+        if target[i] == ' ' {
+            last_space = Some(i);
+        }
+        if len_so_far > max_chars {
+            // Break at last space if available; otherwise hard-break.
+            let break_at = match last_space {
+                Some(s) if s >= row_start => s + 1, // include the space on prev row
+                _ => i,
+            };
+            rows.push(row_start..break_at);
+            row_start = break_at;
+            last_space = None;
+            // do not advance i; reprocess in new row
+            continue;
+        }
+        i += 1;
+    }
+    if row_start < target.len() {
+        rows.push(row_start..target.len());
+    }
+    if rows.is_empty() {
+        rows.push(0..0);
+    }
+    rows
+}
+
+fn build_rows_model(session: &Session) -> ModelRc<CharRow> {
+    let ranges = wrap_indices(&session.target, 56);
+    let pos = session.position();
+    let mut rows: Vec<CharRow> = Vec::with_capacity(ranges.len());
+
+    for range in ranges {
+        let mut cells: Vec<CharCell> = Vec::with_capacity(range.end - range.start);
+        for i in range {
+            let ch = session.target[i];
+            let state: i32 = if i < pos {
+                // Already typed: green if it matched, red otherwise.
+                if session.typed[i] == ch {
+                    1
                 } else {
-                    Some(Message::FocusNext)
+                    2
                 }
+            } else if i == pos {
+                3 // cursor
             } else {
-                None
-            }
-        })
-    }
-}
-
-// --- Helper function for calculations (same logic as the console version) ---
-fn calculate_results(sample_text: &str, user_input: &str, duration_secs: f64) -> TypingResult {
-    let typed_chars_count = user_input.chars().count();
-    let mut correct_chars_count = 0;
-    let mut sample_iter = sample_text.chars();
-
-    // Simple character-by-character comparison
-    for typed_char in user_input.chars() {
-        if let Some(sample_char) = sample_iter.next() {
-            if typed_char == sample_char {
-                correct_chars_count += 1;
-            }
-        } else {
-            break; // Stop if user input exceeds sample text length
+                0 // untyped
+            };
+            let fg = finger_for_char(ch).as_i32();
+            cells.push(CharCell {
+                character: ch.to_string().into(),
+                state,
+                finger: fg,
+            });
         }
+        rows.push(CharRow {
+            cells: ModelRc::new(VecModel::from(cells)),
+        });
     }
+    ModelRc::new(VecModel::from(rows))
+}
 
-    let accuracy = if typed_chars_count > 0 {
-        (correct_chars_count as f64 / typed_chars_count as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    // Standard WPM calculation (Net WPM based on correct characters)
-    let wpm = if duration_secs > 0.0 {
-        (correct_chars_count as f64 / 5.0) / (duration_secs / 60.0)
-    } else {
-        0.0
-    };
-
-    TypingResult {
-        wpm,
-        accuracy,
-        duration: duration_secs,
+fn finger_label(f: Finger) -> &'static str {
+    match f {
+        Finger::None => "any",
+        Finger::LeftPinky => "left pinky",
+        Finger::LeftRing => "left ring",
+        Finger::LeftMiddle => "left middle",
+        Finger::LeftIndex => "left index",
+        Finger::LeftThumb => "left thumb",
+        Finger::RightThumb => "right thumb",
+        Finger::RightIndex => "right index",
+        Finger::RightMiddle => "right middle",
+        Finger::RightRing => "right ring",
+        Finger::RightPinky => "right pinky",
     }
 }
 
-// --- Main function to run the Iced application ---
-pub fn main() -> iced::Result {
-    // Set window settings if needed (size, etc.)
-    let settings = Settings {
-        window: iced::window::Settings {
-            // Corrected line: Construct iced::Size explicitly
-            size: iced::Size::new(600.0, 400.0), // Set initial window size using floats
-            ..Default::default()
-        },
-        ..Default::default()
+// ---------------------------------------------------------------------------
+//  Updating the UI from the current state
+// ---------------------------------------------------------------------------
+
+fn update_session_view(ui: &AppWindow, state: &AppState) {
+    let session = match &state.session {
+        Some(s) => s,
+        None => return,
     };
 
-    // Run the Iced application
-    TypingTutor::run(settings)
+    // Title & description per mode
+    match state.mode {
+        Mode::Lesson(i) => {
+            let lesson = &lessons::LESSONS[i];
+            ui.set_session_title(lesson.title.into());
+            ui.set_session_description(lesson.description.into());
+        }
+        Mode::Practice(i) => {
+            let text = &texts::TEXTS[i];
+            ui.set_session_title(format!("Practice: {}", text.title).into());
+            ui.set_session_description(
+                "Type the text below as quickly and accurately as you can. \
+                 The progress bar fills up as you advance."
+                    .into(),
+            );
+        }
+        Mode::Home => return,
+    }
+
+    ui.set_rows(build_rows_model(session));
+
+    // Highlight next key + finger
+    if let Some(&c) = session.target.get(session.position()) {
+        let lower = c.to_ascii_lowercase().to_string();
+        ui.set_next_key(lower.into());
+        let f = finger_for_char(c);
+        ui.set_active_finger(f.as_i32());
+        ui.set_finger_hint_index(f.as_i32());
+        let display_char = if c == ' ' {
+            "space".to_string()
+        } else {
+            format!("'{}'", c)
+        };
+        if matches!(f, Finger::None) {
+            ui.set_finger_hint(format!("Next: {}", display_char).into());
+        } else {
+            ui.set_finger_hint(
+                format!("Next: {}  —  use your {}", display_char, finger_label(f)).into(),
+            );
+        }
+    } else {
+        ui.set_next_key("".into());
+        ui.set_active_finger(-1);
+        ui.set_finger_hint_index(-1);
+        ui.set_finger_hint("Lesson complete! Press Retry or move to the next one.".into());
+    }
+
+    // Live stats
+    let now = Instant::now();
+    let elapsed = session.elapsed_secs(now);
+    ui.set_time_text(format!("{:.1}s", elapsed).into());
+    ui.set_wpm_text(format!("{:.0}", session.wpm(now)).into());
+    ui.set_accuracy_text(format!("{:.0}%", session.accuracy()).into());
+    ui.set_errors_text(format!("{}", session.errors).into());
+    let progress = if session.target.is_empty() {
+        0.0
+    } else {
+        session.position() as f32 / session.target.len() as f32
+    };
+    ui.set_progress(progress);
+
+    // Finished state
+    ui.set_finished(session.is_finished());
+    if session.is_finished() {
+        ui.set_result_summary(
+            format!(
+                "WPM: {:.0}     Accuracy: {:.0}%     Time: {:.1}s     Errors: {}",
+                session.wpm(now),
+                session.accuracy(),
+                elapsed,
+                session.errors,
+            )
+            .into(),
+        );
+    }
+}
+
+fn refresh_picker_lists(ui: &AppWindow, state: &AppState) {
+    // Lessons sidebar
+    let items: Vec<PickerItem> = lessons::LESSONS
+        .iter()
+        .enumerate()
+        .map(|(i, l)| PickerItem {
+            title: l.title.into(),
+            subtitle: format!("{} characters", l.text.chars().count()).into(),
+            completed: state.lessons_completed.contains(&i),
+        })
+        .collect();
+    ui.set_lessons_list(ModelRc::new(VecModel::from(items)));
+
+    // Texts sidebar
+    let items: Vec<PickerItem> = texts::TEXTS
+        .iter()
+        .map(|t| PickerItem {
+            title: t.title.into(),
+            subtitle: format!("{} characters", t.content.chars().count()).into(),
+            completed: false,
+        })
+        .collect();
+    ui.set_texts_list(ModelRc::new(VecModel::from(items)));
+
+    // Selected indices
+    if let Mode::Lesson(i) = state.mode {
+        ui.set_lessons_selected_index(i as i32);
+    }
+    if let Mode::Practice(i) = state.mode {
+        ui.set_texts_selected_index(i as i32);
+    }
+}
+
+fn refresh_home(ui: &AppWindow, state: &AppState) {
+    let text = match state.best_wpm {
+        Some(wpm) => format!(
+            "Best so far: {:.0} WPM\nLessons completed: {} / {}",
+            wpm,
+            state.lessons_completed.len(),
+            lessons::LESSONS.len()
+        ),
+        None => "Complete a typing test to see your\nbest result here.".to_string(),
+    };
+    ui.set_last_result_text(text.into());
+}
+
+// ---------------------------------------------------------------------------
+//  Session helpers
+// ---------------------------------------------------------------------------
+
+fn start_lesson(state: &mut AppState, idx: usize) {
+    let idx = idx.min(lessons::LESSONS.len() - 1);
+    state.mode = Mode::Lesson(idx);
+    state.last_lesson_index = idx;
+    state.session = Some(Session::new(lessons::LESSONS[idx].text));
+}
+
+fn start_practice(state: &mut AppState, idx: usize) {
+    let idx = idx.min(texts::TEXTS.len() - 1);
+    state.mode = Mode::Practice(idx);
+    state.last_text_index = idx;
+    state.session = Some(Session::new(texts::TEXTS[idx].content));
+}
+
+fn restart_current(state: &mut AppState) {
+    match state.mode {
+        Mode::Lesson(i) => state.session = Some(Session::new(lessons::LESSONS[i].text)),
+        Mode::Practice(i) => state.session = Some(Session::new(texts::TEXTS[i].content)),
+        Mode::Home => {}
+    }
+}
+
+fn advance_to_next(state: &mut AppState) {
+    match state.mode {
+        Mode::Lesson(i) => {
+            let next = (i + 1).min(lessons::LESSONS.len() - 1);
+            start_lesson(state, next);
+        }
+        Mode::Practice(i) => {
+            let next = (i + 1) % texts::TEXTS.len();
+            start_practice(state, next);
+        }
+        Mode::Home => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Wiring
+// ---------------------------------------------------------------------------
+
+fn schedule_clear_pressed(ui: &AppWindow) {
+    let ui_handle = ui.as_weak();
+    Timer::single_shot(Duration::from_millis(140), move || {
+        if let Some(ui) = ui_handle.upgrade() {
+            ui.set_pressed_key("".into());
+            ui.set_pressed_finger(-1);
+        }
+    });
+}
+
+fn handle_key_typed(ui: &AppWindow, state: &Rc<RefCell<AppState>>, text: &str) {
+    let mut s = state.borrow_mut();
+
+    // Auto-start the session/page if user starts typing on the home page
+    // (a nice shortcut).
+    if matches!(s.mode, Mode::Home) {
+        return;
+    }
+
+    let session = match s.session.as_mut() {
+        Some(x) => x,
+        None => return,
+    };
+    if session.is_finished() {
+        return;
+    }
+    // Take the first usable character from the input string.
+    let typed_char = match text.chars().next() {
+        Some(c) if !c.is_control() => c,
+        _ => return,
+    };
+
+    if session.start_time.is_none() {
+        session.start_time = Some(Instant::now());
+    }
+
+    let pos = session.position();
+    if pos >= session.target.len() {
+        return;
+    }
+    let expected = session.target[pos];
+    if typed_char != expected {
+        session.errors += 1;
+    }
+    session.typed.push(typed_char);
+
+    // Visual feedback: pressed key + pressed finger
+    let pressed_key = typed_char.to_ascii_lowercase().to_string();
+    ui.set_pressed_key(pressed_key.into());
+    let pf = finger_for_char(typed_char).as_i32();
+    ui.set_pressed_finger(pf);
+    schedule_clear_pressed(ui);
+
+    // Did we just finish?
+    if session.position() >= session.target.len() {
+        session.finished_at = Some(Instant::now());
+        let final_wpm = session.wpm(session.finished_at.unwrap());
+        if let Mode::Lesson(i) = s.mode {
+            s.lessons_completed.insert(i);
+        }
+        if s.best_wpm.map_or(true, |b| final_wpm > b) {
+            s.best_wpm = Some(final_wpm);
+        }
+        refresh_home(ui, &s);
+        refresh_picker_lists(ui, &s);
+    }
+
+    update_session_view(ui, &s);
+}
+
+fn handle_backspace(ui: &AppWindow, state: &Rc<RefCell<AppState>>) {
+    let mut s = state.borrow_mut();
+    let session = match s.session.as_mut() {
+        Some(x) => x,
+        None => return,
+    };
+    if session.is_finished() {
+        return;
+    }
+    if session.position() > 0 {
+        session.typed.pop();
+    }
+    update_session_view(ui, &s);
+}
+
+fn main() -> Result<(), slint::PlatformError> {
+    let ui = AppWindow::new()?;
+    let state = Rc::new(RefCell::new(AppState::new()));
+
+    refresh_picker_lists(&ui, &state.borrow());
+    refresh_home(&ui, &state.borrow());
+
+    // ----- Navigation -------------------------------------------------------
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_nav_home(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                s.mode = Mode::Home;
+                s.session = None;
+                ui.set_page(AppPage::Home);
+                refresh_home(&ui, &s);
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_nav_lessons(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                let idx = match s.mode {
+                    Mode::Lesson(i) => i,
+                    _ => s.last_lesson_index,
+                };
+                start_lesson(&mut s, idx);
+                ui.set_page(AppPage::Lessons);
+                refresh_picker_lists(&ui, &s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_nav_practice(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                let idx = match s.mode {
+                    Mode::Practice(i) => i,
+                    _ => s.last_text_index,
+                };
+                start_practice(&mut s, idx);
+                ui.set_page(AppPage::Practice);
+                refresh_picker_lists(&ui, &s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+
+    // ----- Picker callbacks -------------------------------------------------
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_lesson_clicked(move |i| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                start_lesson(&mut s, i as usize);
+                refresh_picker_lists(&ui, &s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_text_clicked(move |i| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                start_practice(&mut s, i as usize);
+                refresh_picker_lists(&ui, &s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+
+    // ----- Restart / next item ---------------------------------------------
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_restart(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                restart_current(&mut s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_next_item(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                let mut s = state.borrow_mut();
+                advance_to_next(&mut s);
+                refresh_picker_lists(&ui, &s);
+                update_session_view(&ui, &s);
+                ui.invoke_focus_typing();
+            }
+        });
+    }
+
+    // ----- Typing -----------------------------------------------------------
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_key_typed(move |text| {
+            if let Some(ui) = ui_handle.upgrade() {
+                let text: String = text.into();
+                handle_key_typed(&ui, &state, &text);
+            }
+        });
+    }
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        ui.on_backspace(move || {
+            if let Some(ui) = ui_handle.upgrade() {
+                handle_backspace(&ui, &state);
+            }
+        });
+    }
+
+    // ----- Live timer to drive WPM / elapsed time --------------------------
+    let live_timer = Timer::default();
+    {
+        let ui_handle = ui.as_weak();
+        let state = state.clone();
+        live_timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
+            let s = state.borrow();
+            if let Some(session) = &s.session {
+                if session.start_time.is_some() && !session.is_finished() {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        update_session_view(&ui, &s);
+                    }
+                }
+            }
+        });
+    }
+
+    ui.run()?;
+    drop(live_timer);
+    Ok(())
 }
