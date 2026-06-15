@@ -1,98 +1,127 @@
-# Rust GUI Typing Tutor Demo (using Iced)
+# Keystroke
 
-> A very basic proof-of-concept GUI typing tutor application built with Rust and the [Iced](https://github.com/iced-rs/iced) GUI library.
+> A typing tutor inspired by Typing Pal, built in Rust with the [Slint](https://slint.dev/) GUI toolkit.
 
-## ⚠️ Status / Disclaimer ⚠️
+## Overview
 
-**This project is a minimal demonstration and NOT a fully functional typing tutor.**
+Keystroke is a desktop typing tutor that focuses on three things:
 
-It was created as a programming exercise to illustrate basic GUI concepts in Rust with the Iced library. It lacks many core features expected of a real typing tutor application.
+* **Learning** the keyboard one finger at a time through guided lessons.
+* **Practicing** on real prose with live WPM and accuracy feedback.
+* **Competing** against another player over the local network in a head-to-head typing race.
+
+The app uses a visual on-screen keyboard with finger-color hints to teach correct fingering, and adapts to your physical keyboard layout (auto-detected on Windows).
 
 ## Features
 
-### Current Features (Basic Proof-of-Concept)
+### Sections
 
-* Displays a hardcoded sample text passage.
-* A simple GUI window using the Iced framework.
-* A "Start Typing" / "Restart Test" button to begin/reset.
-* A text input field for the user to type into.
-* Basic timing: Starts a timer when the test begins and stops when the input length matches the sample text length.
-* Post-test calculation and display of:
-    * Time taken (seconds)
-    * Accuracy (%)
-    * Net WPM (Words Per Minute, based on standard 5 chars/word and correct characters)
+The app is organized into four pages, accessible from the top navigation bar:
 
-### Missing / Planned Features
+* **Home** — landing page with quick links to each section and your most recent result.
+* **Lessons** — eight progressive lessons that introduce the home row, top row, bottom row, space bar, capitals, and punctuation.
+* **Practice** — pick a sample text and measure your speed and accuracy in a free typing test.
+* **Games** — race another Keystroke instance on your LAN in a real-time typing match.
 
-This demo **lacks** many essential features, including but not limited to:
+### Typing engine
 
-* Real-time feedback (character-by-character validation and error highlighting).
-* Visual keyboard display.
-* Loading different lessons or texts (currently uses one hardcoded string).
-* User profiles and progress saving.
-* More sophisticated WPM/accuracy calculations (e.g., handling backspace, error penalties).
-* Proper handling of test completion (e.g., detecting Enter key instead of just matching length).
-* Advanced UI elements and better layout.
-* Configuration options.
+* Live, character-by-character validation with colored feedback (correct / incorrect / pending).
+* Automatic line wrapping that respects word boundaries.
+* WPM (based on the standard 5-characters-per-word convention) and accuracy reported on completion.
+* A randomized "Next" button in Practice to cycle through sample texts.
+
+### Visual keyboard
+
+* On-screen keyboard that highlights the next key to press.
+* Per-finger color coding to teach correct hand position.
+* Adapts to the active keyboard layout.
+
+### Keyboard layouts
+
+Built-in layouts (selectable; auto-detected from the active Windows layout when available):
+
+* US English (QWERTY) — KLID `00000409`
+* UK English (QWERTY) — KLID `00000809`
+* French (AZERTY) — KLID `0000040C`
+* German (QWERTZ) — KLID `00000407`
+* Spanish (QWERTY) — KLID `0000040A`
+* Norwegian (QWERTY) — KLID `00000414`
+
+### Sample texts
+
+The Practice mode ships with passages in English (Tolkien, C.S. Lewis, selected Bible verses) and Norwegian (Bjørnson's *Ja, vi elsker*, Ibsen's *Peer Gynt*, Hamsun's *Sult*, a Norwegian folk tale).
+
+### LAN multiplayer race (Games)
+
+* UDP broadcast discovery finds other Keystroke instances on the same local network — including multiple instances on the same machine.
+* TCP-based race session with a synchronized countdown.
+* Live opponent progress bar while you type.
+* Result summary with winner/tie reporting.
+
+## Screenshots
+
+| Home | Lessons |
+| --- | --- |
+| ![Home page](screenshots/home.png) | ![Lessons page](screenshots/lessons.png) |
+
+| Practice | Games |
+| --- | --- |
+| ![Practice page](screenshots/practice.png) | ![Games page](screenshots/games.png) |
 
 ## Technology
 
 * **Language:** [Rust](https://www.rust-lang.org/) (Edition 2021)
-* **GUI Library:** [Iced](https://github.com/iced-rs/iced) (~0.12)
+* **GUI:** [Slint](https://slint.dev/) 1.8
+* **Networking:** `socket2` for UDP/TCP socket configuration (enables multiple instances on one host to share the discovery port).
+* **Windows integration:** `windows-sys` for active keyboard layout detection.
 
 ## Prerequisites
 
-* **Rust Toolchain:** Install Rust via [rustup](https://rustup.rs/).
-* **System Dependencies:** The Iced library relies on native dependencies for rendering, windowing, etc. You may need to install system libraries depending on your Operating System (Linux, macOS, Windows). Please refer to the [Iced documentation](https://docs.iced.rs/getting-started/installation) for platform-specific requirements (e.g., `libfontconfig-dev`, `libgtk-3-dev` on Debian/Ubuntu).
+* **Rust toolchain** — install via [rustup](https://rustup.rs/).
+* **Platform dependencies for Slint** — see the [Slint platform requirements](https://docs.slint.dev/latest/docs/slint/src/quickstart/) for your OS. Windows requires no extra packages; Linux typically needs Fontconfig and a working OpenGL / Vulkan stack.
 
-## Getting Started
+## Getting started
 
-### Installation
+```bash
+git clone https://github.com/rmpr/keystroke.git
+cd keystroke
+cargo run --release
+```
 
-1.  Clone this repository (or download the source code):
-    ```bash
-    # Replace with the actual URL if you put this on GitHub/GitLab etc.
-    git clone https://github.com/rmpr/keystroke.git
-    cd keystroke
-    ```
+The first build downloads Slint and the other dependencies and may take a few minutes.
 
-### Building
+## Using the app
 
-2.  Build the project using Cargo:
-    ```bash
-    cargo build
-    ```
-    *(This will download dependencies and compile the code. The first build might take some time.)*
+1. Launch with `cargo run` (or run the built binary).
+2. From the **Home** page, choose Lessons, Practice, or Games.
+3. In **Lessons** or **Practice**, just start typing — the timer begins on the first keystroke. Use the picker on the left to switch lesson or text.
+4. In **Games**:
+   * Set your display name.
+   * Wait for other Keystroke instances on the LAN to appear in the lobby.
+   * Click a peer to send a race invite. They'll see an accept/decline prompt.
+   * After both sides accept, a countdown starts and the race begins.
+   * The first player to finish the text correctly wins.
 
-### Running
+To try multiplayer locally, launch two instances of the app on the same machine — they will discover each other through the shared discovery port.
 
-3.  Run the compiled application:
-    ```bash
-    cargo run
-    ```
+## Development
 
-## How to Use
+```bash
+cargo build          # debug build
+cargo test           # run unit tests (wrap-indices, etc.)
+cargo run --release  # optimized run
+```
 
-1.  Launch the application (`cargo run`).
-2.  A window will appear displaying the sample text.
-3.  Click the "Start Typing!" button.
-4.  The timer starts, and you can type in the text input field below the sample text.
-5.  Try to type the sample text exactly.
-6.  Once the number of characters you've typed matches the length of the sample text, the test will automatically stop, and the results (Time, Accuracy, WPM) will be displayed.
-7.  You can click "Restart Test" to try again.
+The codebase is laid out as:
 
-## Future Development Ideas
-
-If you wanted to expand this demo:
-
-* Implement real-time character validation and visual feedback (e.g., coloring text).
-* Use a more robust method to end the test.
-* Load lesson text from external files (e.g., `.txt`, `.json`).
-* Add multiple lessons and a way to select them.
-* Introduce user profiles to track progress over time.
-* Improve the UI/UX design.
-* Add a visual keyboard representation.
+* `src/main.rs` — application state, Slint bindings, lesson/practice/game flow.
+* `src/keyboard_layout.rs` — layout definitions and Windows layout detection.
+* `src/texts.rs` — Practice-mode sample texts.
+* `src/lessons.rs` — guided lesson content.
+* `src/finger.rs` — finger-to-key mapping for the on-screen keyboard.
+* `src/net.rs` — LAN discovery and race networking.
+* `ui/appwindow.slint` — the entire UI.
 
 ## License
 
-This project currently does not have a license file. If you plan to distribute or build upon this code, it's recommended to choose an open-source license (e.g., MIT License or Apache License 2.0) and add a `LICENSE` file to the repository.
+Released under the [MIT License](LICENSE).
